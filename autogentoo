@@ -1,10 +1,18 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Autogentoo v1 - interactive Gentoo OpenRC installer
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+set +x
 set -Eeuo pipefail
 shopt -s extglob nullglob
 umask 077
+ulimit -c 0
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+unset BASH_ENV ENV CDPATH POSIXLY_CORRECT TAR_OPTIONS XZ_OPT XZ_DEFAULTS GZIP BZIP2 \
+    GNUPGHOME DIALOGRC XDG_CONFIG_HOME OPENSSL_CONF OPENSSL_CONF_INCLUDE \
+    OPENSSL_MODULES OPENSSL_ENGINES
 
 readonly VERSION="1.0.0"
 readonly GENTOO_KEY="/usr/share/openpgp-keys/gentoo-release.asc"
@@ -20,6 +28,11 @@ DIALOG_READY=0
 TARGET=/mnt/gentoo
 LOG=""
 WORKDIR=""
+STAGE_DIR=""
+STAGE_PATH=""
+STAGE_SIZE=0
+STAGE_DIGEST=""
+STAGE_BASE=""
 OUR_SWAP=""
 TARGET_ACTIVE=0
 
@@ -41,6 +54,10 @@ ESP_ACTION="reuse"
 ROOT_BYTES=0
 ORIGINAL_ROOT_BYTES=0
 ORIGINAL_DISK_BYTES=0
+ORIGINAL_DISKSEQ=""
+ORIGINAL_SECTOR_SIZE=0
+ORIGINAL_ROOT_ID=""
+ORIGINAL_ESP_ID=""
 GAP_START=0
 GAP_END=0
 ROOT_START=0
@@ -55,12 +72,13 @@ KEYMAP="us"
 XKB_LAYOUT="us"
 HOSTNAME="gentoo"
 USERNAME=""
-USER_PASSWORD=""
+USER_PASSWORD_HASH=""
 ROOT_SAME_PASSWORD=0
 
 declare -A PROTECTED_DISKS=()
 
 log() {
+    [[ -n $LOG ]] || return 0
     printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"
 }
 
@@ -109,20 +127,35 @@ on_error() {
 }
 
 cleanup() {
-    local status=$?
+    local status=$? cleanup_failed=0 mount_status
     trap - ERR EXIT
-    set +e
-    [[ -n $USER_PASSWORD ]] && unset USER_PASSWORD
-    if [[ -n $OUR_SWAP ]] && swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$OUR_SWAP"; then
-        swapoff "$OUR_SWAP" >>"$LOG" 2>&1
+    set +eu
+    unset USER_PASSWORD_HASH
+    if [[ -n $OUR_SWAP ]]; then
+        swapoff "$OUR_SWAP" >>"$LOG" 2>&1 || cleanup_failed=1
     fi
-    if (( TARGET_ACTIVE )) && mountpoint -q "$TARGET" 2>/dev/null; then
-        if [[ -n $LOG && -d $TARGET/var/log ]]; then
-            install -m 600 "$LOG" "$TARGET/var/log/autogentoo.log" 2>/dev/null
+    if [[ -n $STAGE_DIR && -d $STAGE_DIR ]]; then
+        rm -rf -- "$STAGE_DIR" || cleanup_failed=1
+    fi
+    if (( TARGET_ACTIVE )); then
+        if mountpoint -q "$TARGET" 2>/dev/null; then
+            if [[ -n $LOG && -d $TARGET/var/log ]]; then
+                install -m 600 "$LOG" "$TARGET/var/log/autogentoo.log" 2>/dev/null ||
+                    cleanup_failed=1
+            fi
+            umount -R "$TARGET" >>"$LOG" 2>&1 || cleanup_failed=1
+        else
+            mount_status=$?
+            (( mount_status == 32 )) || cleanup_failed=1
         fi
-        umount -R "$TARGET" >>"$LOG" 2>&1
     fi
-    [[ -n $WORKDIR && -d $WORKDIR ]] && rm -rf -- "$WORKDIR"
+    if [[ -n $WORKDIR && -d $WORKDIR ]]; then
+        rm -rf -- "$WORKDIR" || cleanup_failed=1
+    fi
+    if (( cleanup_failed )); then
+        printf 'autogentoo: cleanup failed; check swap and mounts before rebooting.\n' >&2
+        (( status == 0 )) && status=1
+    fi
     exit "$status"
 }
 
@@ -159,12 +192,41 @@ valid_username() {
     [[ $1 =~ ^[a-z_][a-z0-9_-]{0,30}$ && $1 != root ]]
 }
 
+available_username() {
+    valid_username "$1" && [[ $1 != sddm ]] && awk -F: -v name="$1" '
+        $1 == name { found=1 }
+        END { exit found ? 1 : 0 }
+    ' /etc/passwd
+}
+
 valid_locale() {
-    [[ $1 =~ ^[A-Za-z]{2,3}_[A-Za-z]{2}([.@][A-Za-z0-9_-]+)*(\.UTF-8)?$ ]]
+    [[ $1 =~ ^[A-Za-z]{2,3}_[A-Za-z0-9]{2,3}(\.[A-Za-z0-9_-]+)?(@[A-Za-z0-9_-]+)?$ && ${#1} -le 64 ]]
+}
+
+supported_locale() {
+    valid_locale "$1" && [[ -r /usr/share/i18n/SUPPORTED ]] &&
+        grep -Fqx -- "$1 UTF-8" /usr/share/i18n/SUPPORTED
 }
 
 valid_layout() {
     [[ $1 =~ ^[A-Za-z0-9_-]{1,32}$ ]]
+}
+
+supported_keymap() {
+    local keymap=$1 root=${2:-/usr/share/keymaps} match
+    valid_layout "$keymap" || return 1
+    match=$(find "$root" -type f -name "$keymap.map*" -print -quit 2>/dev/null) ||
+        return 1
+    [[ -n $match ]]
+}
+
+valid_timezone() {
+    local timezone=$1 magic
+    [[ $timezone != /* && $timezone != *..* && -f /usr/share/zoneinfo/$timezone ]] ||
+        return 1
+    magic=$(od -An -t x1 -N 4 "/usr/share/zoneinfo/$timezone" 2>/dev/null |
+        tr -d '[:space:]') || return 1
+    [[ $magic == 545a6966 ]]
 }
 
 jobs_for() {
@@ -201,6 +263,14 @@ swap_limits() {
     (( maximum < 0 )) && maximum=0
     (( recommended > maximum )) && recommended=$maximum
     printf '%d %d\n' "$recommended" "$maximum"
+}
+
+bounded_uint() {
+    local value=$1 maximum=$2 number
+    [[ $value =~ ^[0-9]+$ && ${#value} -le 18 ]] || return 1
+    number=$((10#$value))
+    (( number <= maximum )) || return 1
+    printf '%d' "$number"
 }
 
 partition_name() {
@@ -244,49 +314,146 @@ ask_yesno() {
 
 require_commands() {
     local missing=() command
-    for command in dialog curl gpgv sha512sum tar lsblk findmnt blockdev parted \
+    for command in dialog curl gpg gpgv sha512sum tar lsblk findmnt blockdev parted \
         wipefs mkfs.fat fsck.fat mkfs.btrfs btrfs blkid mount umount mountpoint \
         chroot swapon swapoff partprobe udevadm lspci awk sed grep od stat install \
-        tee nproc paste readlink head tr sort find mktemp cp rm mkdir chmod ln; do
+        tee nproc paste readlink tail tr sort find mktemp cp rm mkdir chmod ln losetup xz openssl; do
         command -v "$command" >/dev/null 2>&1 || missing+=("$command")
     done
     ((${#missing[@]} == 0)) || die "Missing required live-media tools: ${missing[*]}"
 }
 
 secure_boot_is_disabled() {
-    local vars=(/sys/firmware/efi/efivars/SecureBoot-*) value var
-    ((${#vars[@]})) || return 1
-    for var in "${vars[@]}"; do
-        value=$(od -An -t u1 -j 4 -N 1 "$var" 2>/dev/null | tr -d ' ')
-        [[ $value == 0 ]] && return 0
-    done
-    return 1
+    local var=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c value
+    [[ -r $var ]] || return 1
+    value=$(od -An -t u1 -j 4 -N 1 "$var" 2>/dev/null | tr -d ' ') || return 1
+    [[ $value == 0 ]]
 }
 
 parent_disk() {
     local device=$1 type parent
-    device=$(readlink -f -- "$device")
+    device=$(readlink -f -- "$device") || return 1
     while [[ -b $device ]]; do
-        type=$(lsblk -dnro TYPE "$device" 2>/dev/null || true)
-        [[ $type == disk ]] && { printf '%s' "$device"; return 0; }
-        parent=$(lsblk -dnro PKNAME "$device" 2>/dev/null | head -n1)
+        type=$(lsblk -dnro TYPE "$device" 2>/dev/null) || return 1
+        [[ $type == disk || $type == loop ]] && { printf '%s' "$device"; return 0; }
+        parent=$(lsblk -dnro PKNAME "$device" 2>/dev/null) || return 1
+        parent=${parent%%$'\n'*}
         [[ -n $parent ]] || return 1
         device=/dev/$parent
     done
     return 1
 }
 
+disk_sequence() {
+    local kname sequence
+    kname=$(lsblk -dnro KNAME "$1") || return 1
+    [[ $kname != */* && -r /sys/class/block/$kname/diskseq ]] || return 1
+    read -r sequence <"/sys/class/block/$kname/diskseq" || return 1
+    [[ $sequence =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$sequence"
+}
+
+partition_identity() {
+    local part=$1 kname parent uuid start sectors
+    kname=$(lsblk -dnro KNAME "$part") || return 1
+    parent=$(parent_disk "$part") || return 1
+    uuid=$(lsblk -dnro PARTUUID "$part") || return 1
+    [[ $kname != */* && -n $uuid ]] || return 1
+    read -r start <"/sys/class/block/$kname/start" || return 1
+    read -r sectors <"/sys/class/block/$kname/size" || return 1
+    [[ $start =~ ^[0-9]+$ && $sectors =~ ^[0-9]+$ ]] || return 1
+    printf '%s|%s|%s|%s' "$parent" "$uuid" "$start" "$sectors"
+}
+
+disk_state() {
+    local disk=$1 before after bytes sector_size
+    before=$(disk_sequence "$disk") || return 1
+    bytes=$(blockdev --getsize64 "$disk") || return 1
+    sector_size=$(blockdev --getss "$disk") || return 1
+    after=$(disk_sequence "$disk") || return 1
+    [[ $before == "$after" && $bytes =~ ^[0-9]+$ && $sector_size =~ ^[0-9]+$ ]] || return 1
+    (( bytes > 0 && sector_size >= 512 && sector_size % 512 == 0 && MIB % sector_size == 0 )) || return 1
+    printf '%s %s %s' "$before" "$bytes" "$sector_size"
+}
+
+disk_state_still_valid() {
+    local state
+    state=$(disk_state "$DISK") || return 1
+    [[ $state == "$ORIGINAL_DISKSEQ $ORIGINAL_DISK_BYTES $ORIGINAL_SECTOR_SIZE" ]]
+}
+
+protect_loop_backing() {
+    local loop=$1 depth=$2 backing source
+    (( depth < 8 )) || return 1
+    backing=$(losetup --noheadings --raw --output BACK-FILE "$loop" 2>/dev/null) ||
+        return 1
+    [[ -n $backing && $backing == /* && $backing != *$'\n'* ]] || return 1
+    if [[ -b $backing ]]; then
+        protect_source_disk "$backing" "$((depth + 1))"
+        return
+    fi
+    [[ -f $backing ]] || return 1
+    source=$(findmnt -n -e -T "$backing" -o SOURCE 2>/dev/null) || return 1
+    [[ -n $source && $source != *$'\n'* && $source != "$loop" ]] || return 1
+    protect_source_disk "$source" "$((depth + 1))"
+}
+
+protect_ancestor_rows() {
+    local rows=$1 depth=$2 name type device
+    local -a loops=()
+    while read -r name type; do
+        [[ -n $name && -n $type ]] || return 1
+        case $type in
+            disk)
+                device=$(readlink -f -- "$name") || return 1
+                PROTECTED_DISKS["$device"]=1
+                ;;
+            loop)
+                device=$(readlink -f -- "$name") || return 1
+                loops+=("$device")
+                ;;
+        esac
+    done <<<"$rows"
+    for device in "${loops[@]}"; do
+        protect_loop_backing "$device" "$depth" || return 1
+    done
+}
+
+protect_source_disk() {
+    local source=$1 depth=${2:-0} rows
+    (( depth <= 8 )) || return 1
+    [[ $source == /dev/* ]] || return 0
+    source=${source%%\[*}
+    source=$(readlink -f -- "$source") || return 1
+    [[ -b $source ]] || return 1
+    rows=$(lsblk -s -nrpo NAME,TYPE "$source" 2>/dev/null) || return 1
+    protect_ancestor_rows "$rows" "$depth"
+}
+
 build_protected_disks() {
-    local source disk
+    local source mounted_sources btrfs_filesystems btrfs_sources
     PROTECTED_DISKS=()
+    mounted_sources=$(findmnt -rn -e -o SOURCE 2>/dev/null) || return 1
     while IFS= read -r source; do
-        [[ $source == /dev/* ]] || continue
-        disk=$(parent_disk "$source" 2>/dev/null || true)
-        [[ -n $disk ]] && PROTECTED_DISKS["$disk"]=1
-    done < <(findmnt -rn -o SOURCE)
+        [[ -z $source ]] || protect_source_disk "$source" || return 1
+    done <<<"$mounted_sources"
+    btrfs_filesystems=$(btrfs filesystem show --all-devices --raw 2>/dev/null) || return 1
+    btrfs_sources=$(awk '
+        $1 == "Total" && $2 == "devices" { multi=($3 ~ /^[0-9]+$/ && $3 > 1); next }
+        multi && $1 == "devid" {
+            for (i=1; i<=NF; i++) if ($i == "path") {
+                path=$(i+1); for (j=i+2; j<=NF; j++) path=path " " $j
+                print path; break
+            }
+        }
+    ' <<<"$btrfs_filesystems") || return 1
+    while IFS= read -r source; do
+        [[ -z $source ]] || protect_source_disk "$source" || return 1
+    done <<<"$btrfs_sources"
 }
 
 preflight() {
+    local efivar_fstype efivar_options mem_kib pci_devices
     [[ $EUID -eq 0 ]] || die "Run this installer as root (sudo ./autogentoo)."
     require_commands
     DIALOG_READY=1
@@ -295,107 +462,219 @@ preflight() {
         die "Official Gentoo minimal live media could not be proven."
     fi
     [[ -d /sys/firmware/efi ]] || die "UEFI boot was not detected; BIOS installs are unsupported."
-    [[ $(findmnt -nro FSTYPE /sys/firmware/efi/efivars 2>/dev/null) == efivarfs ]] ||
-        die "efivarfs is not mounted."
-    [[ $(findmnt -nro OPTIONS /sys/firmware/efi/efivars 2>/dev/null) != *ro* ]] ||
-        die "efivarfs is read-only."
+    efivar_fstype=$(findmnt -nro FSTYPE /sys/firmware/efi/efivars 2>/dev/null) ||
+        die "efivarfs could not be inspected."
+    [[ $efivar_fstype == efivarfs ]] || die "efivarfs is not mounted."
+    efivar_options=$(findmnt -nro OPTIONS /sys/firmware/efi/efivars 2>/dev/null) ||
+        die "efivarfs mount options could not be inspected."
+    [[ ,$efivar_options, != *,ro,* ]] || die "efivarfs is read-only."
     secure_boot_is_disabled || die "Secure Boot is enabled or its disabled state cannot be proven."
     [[ -r $GENTOO_KEY ]] || die "Gentoo release keys are missing: $GENTOO_KEY"
+    [[ -r /usr/share/i18n/SUPPORTED ]] || die "The live media locale list is missing."
+    supported_keymap us || die "The live media console keymaps are missing."
     ARCH=$(arch_name "$(uname -m)") || die "Only x86_64/amd64 and aarch64/arm64 are supported."
-    CPU_THREADS=$(nproc)
-    RAM_MIB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+    CPU_THREADS=$(nproc) || die "CPU thread count could not be detected."
+    mem_kib=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo) || die "Installed RAM could not be read."
+    [[ $CPU_THREADS =~ ^[1-9][0-9]*$ && $mem_kib =~ ^[1-9][0-9]*$ ]] ||
+        die "CPU or RAM information is invalid."
+    RAM_MIB=$((mem_kib / 1024))
     (( RAM_MIB > 0 )) || die "Installed RAM could not be detected."
     CPU_VENDOR=$(awk -F: '/vendor_id|CPU implementer/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo)
-    GPU_INFO=$(lspci -nn 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /VGA|3D controller|Display controller/ {print}' | paste -sd '; ' -)
+    pci_devices=$(lspci -nn 2>/dev/null || true)
+    GPU_INFO=$(awk 'BEGIN{IGNORECASE=1} /VGA|3D controller|Display controller/ {print}' \
+        <<<"$pci_devices" | paste -sd '; ' -)
     [[ -n $GPU_INFO ]] || GPU_INFO="No PCI GPU detected"
     [[ $GPU_INFO =~ [Nn][Vv][Ii][Dd][Ii][Aa] ]] && NVIDIA=1
-    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --head \
+    curl --disable --proto '=https' --tlsv1.2 --fail --silent --show-error --head \
         "https://distfiles.gentoo.org/releases/$ARCH/autobuilds/" >/dev/null ||
         die "HTTPS connectivity to Gentoo mirrors failed."
-    build_protected_disks
+    build_protected_disks || die "Storage devices could not be enumerated safely."
     log "Preflight passed: arch=$ARCH threads=$CPU_THREADS ram=${RAM_MIB}MiB gpu=$GPU_INFO"
 }
 
 disk_has_mounts() {
-    lsblk -nrpo MOUNTPOINTS "$1" 2>/dev/null | awk 'NF {found=1} END {exit !found}'
+    local mounts
+    mounts=$(lsblk -nrpo MOUNTPOINTS "$1" 2>/dev/null) || return 0
+    [[ $mounts =~ [^[:space:]] ]]
+}
+
+has_complex_signature() {
+    local device=$1 reject_swap=${2:-0} fstype status
+    if fstype=$(blkid -p -s TYPE -o value "$device" 2>/dev/null); then
+        [[ -n $fstype ]] || return 0
+    else
+        status=$?
+        (( status == 2 )) && return 1
+        return 0
+    fi
+    (( reject_swap )) && [[ $fstype == swap ]] && return 0
+    case $fstype in
+        *_member|crypto_LUKS|BitLocker|bcache|bcachefs|ceph_bluestore|drbd|VMFS_volume|vdo)
+            return 0
+            ;;
+    esac
+    return 1
 }
 
 disk_has_complex_stack() {
-    local name type fstype
-    while read -r name type; do
-        case $type in disk|part) ;; *) return 0 ;; esac
-        [[ $type == part ]] || continue
-        fstype=$(blkid -s TYPE -o value "$name" 2>/dev/null || true)
-        case $fstype in LVM2_member|linux_raid_member|crypto_LUKS) return 0 ;; esac
-    done < <(lsblk -nrpo NAME,TYPE "$1" 2>/dev/null)
+    local name type ro rows first=1
+    rows=$(lsblk -nrpo NAME,TYPE,RO "$1" 2>/dev/null) || return 0
+    while read -r name type ro; do
+        [[ $ro == 0 ]] || return 0
+        if (( first )); then
+            [[ $type == disk ]] || return 0
+            first=0
+        else
+            [[ $type == part ]] || return 0
+        fi
+        has_complex_signature "$name" && return 0
+    done <<<"$rows"
+    (( first )) && return 0
     return 1
 }
 
 safe_disk() {
-    local disk=$1
+    local disk=$1 type ro
+    disk=$(readlink -f -- "$disk") || return 1
     [[ -b $disk ]] || return 1
-    [[ $(lsblk -dnro TYPE "$disk") == disk ]] || return 1
-    [[ $(lsblk -dnro RO "$disk") == 0 ]] || return 1
+    type=$(lsblk -dnro TYPE "$disk") || return 1
+    ro=$(lsblk -dnro RO "$disk") || return 1
+    [[ $type == disk && $ro == 0 ]] || return 1
     [[ -z ${PROTECTED_DISKS[$disk]:-} ]] || return 1
     ! disk_has_mounts "$disk" || return 1
     ! disk_has_complex_stack "$disk" || return 1
 }
 
 disk_menu() {
-    local disk size model
-    while IFS= read -r disk; do
+    local disk type size model devices state sequence bytes sector_size
+    devices=$(lsblk -dnpo NAME,TYPE 2>/dev/null) || return 1
+    while read -r disk type; do
+        [[ $type == disk ]] || continue
         safe_disk "$disk" || continue
-        size=$(lsblk -dnro SIZE "$disk")
-        model=$(lsblk -dnro MODEL "$disk" | sed 's/[[:space:]]*$//')
-        printf '%s\t%s %s\n' "$disk" "$size" "${model:-disk}"
-    done < <(lsblk -dnpo NAME,TYPE | awk '$2=="disk" {print $1}')
+        state=$(disk_state "$disk") || continue
+        read -r sequence bytes sector_size <<<"$state"
+        size=$(lsblk -dnro SIZE "$disk") || continue
+        model=$(lsblk -dnro MODEL "$disk" 2>/dev/null) || model=""
+        model=${model%%$'\n'*}
+        model=$(printf '%s' "$model" | tr -cd '[:print:]') || model=""
+        model=${model%${model##*[![:space:]]}}
+        printf '%s\t%s %s\t%s\t%s\t%s\n' "$disk" "$size" "${model:-disk}" \
+            "$sequence" "$bytes" "$sector_size"
+    done <<<"$devices"
 }
 
 disk_is_gpt() {
-    [[ $(parted -sm "$1" print 2>/dev/null | awk -F: 'NR==2 {print $6}') == gpt ]]
+    local table label
+    table=$(parted -sm "$1" print 2>/dev/null) || return 1
+    label=$(awk -F: 'NR==2 {print $6}' <<<"$table") || return 1
+    [[ $label == gpt ]]
 }
 
 parted_rows() {
-    parted -sm "$1" unit s print 2>/dev/null | awk -F: '$1 ~ /^[0-9]+$/ {print}'
+    local table rows
+    table=$(parted -sm "$1" unit s print 2>/dev/null) || return 1
+    rows=$(awk -F: '$1 ~ /^[0-9]+$/ {print}' <<<"$table") || return 1
+    [[ -z $rows ]] || printf '%s\n' "$rows"
 }
 
 free_extents() {
-    parted -sm "$1" unit s print free 2>/dev/null | awk -F: \
-        'tolower($5) ~ /free/ {gsub(/s/,"",$2); gsub(/s/,"",$3); gsub(/s/,"",$4); print $2, $3, $4}'
+    local table extents
+    table=$(parted -sm "$1" unit s print free 2>/dev/null) || return 1
+    extents=$(awk -F: 'tolower($5) ~ /free/ {
+        gsub(/s/,"",$2); gsub(/s/,"",$3); gsub(/s/,"",$4); print $2, $3, $4
+    }' <<<"$table") || return 1
+    [[ -z $extents ]] || printf '%s\n' "$extents"
+}
+
+aligned_extent() {
+    local start=$1 end=$2 sector_size=$3 alignment
+    (( MIB % sector_size == 0 )) || return 1
+    alignment=$((MIB / sector_size))
+    start=$(((start + alignment - 1) / alignment * alignment))
+    end=$(((end + 1) / alignment * alignment - 1))
+    (( end >= start )) || return 1
+    printf '%d %d %d\n' "$start" "$end" "$((end - start + 1))"
+}
+
+fat_free_bytes_from_fsck() {
+    local values cluster used total
+    values=$(awk '
+        NF == 4 && $1 ~ /^[0-9]+$/ && $2 == "bytes" &&
+            $3 == "per" && $4 == "cluster" { cluster=$1 }
+        $NF == "clusters" {
+            split($(NF - 1), counts, "/")
+            if (counts[1] ~ /^[0-9]+$/ && counts[2] ~ /^[0-9]+$/) {
+                used=counts[1]
+                total=counts[2]
+            }
+        }
+        END {
+            if (cluster ~ /^[0-9]+$/ && used ~ /^[0-9]+$/ &&
+                total ~ /^[0-9]+$/) print cluster, used, total
+            else exit 1
+        }
+    ') || return 1
+    read -r cluster used total <<<"$values"
+    [[ $cluster =~ ^[0-9]+$ && $used =~ ^[0-9]+$ && $total =~ ^[0-9]+$ ]] ||
+        return 1
+    (( cluster > 0 && cluster <= MIB && total <= 4294967295 && total >= used )) ||
+        return 1
+    printf '%d\n' "$(((total - used) * cluster))"
 }
 
 esp_free_bytes() {
-    local output
+    local output free bytes
     output=$(LC_ALL=C fsck.fat -n -v "$1" 2>&1) || return 1
-    awk '/bytes free/ {gsub(/,/,"",$1); if ($1 ~ /^[0-9]+$/) {print $1; exit}}' <<<"$output"
+    free=$(fat_free_bytes_from_fsck <<<"$output") || return 1
+    bytes=$(blockdev --getsize64 "$1" 2>/dev/null) || return 1
+    [[ $bytes =~ ^[0-9]+$ ]] && (( free <= bytes )) || return 1
+    printf '%s\n' "$free"
+}
+
+is_fat32() {
+    local device=$1 fstype version
+    fstype=$(blkid -p -s TYPE -o value "$device" 2>/dev/null) || return 1
+    version=$(blkid -p -s VERSION -o value "$device" 2>/dev/null) || return 1
+    [[ $fstype == vfat && $version == FAT32 ]]
 }
 
 is_reusable_esp() {
-    local part=$1 type fstype free
+    local part=$1 device_type type free mounts
     [[ -b $part ]] || return 1
-    [[ -z $(lsblk -nro MOUNTPOINTS "$part" | awk 'NF {print; exit}') ]] || return 1
-    type=${2:-$(lsblk -dnro PARTTYPE "$part")}
-    fstype=$(blkid -s TYPE -o value "$part" 2>/dev/null || true)
-    [[ ${type,,} == "$ESP_GUID" && $fstype == vfat ]] || return 1
-    free=$(esp_free_bytes "$part")
+    device_type=$(lsblk -dnro TYPE "$part") || return 1
+    [[ $device_type == part ]] || return 1
+    mounts=$(lsblk -nro MOUNTPOINTS "$part" 2>/dev/null) || return 1
+    [[ ! $mounts =~ [^[:space:]] ]] || return 1
+    [[ $(blockdev --getro "$part" 2>/dev/null) == 0 ]] || return 1
+    if [[ -n ${2:-} ]]; then
+        type=$2
+    else
+        type=$(lsblk -dnro PARTTYPE "$part") || return 1
+    fi
+    [[ ${type,,} == "$ESP_GUID" ]] && is_fat32 "$part" || return 1
+    free=$(esp_free_bytes "$part") || return 1
     [[ $free =~ ^[0-9]+$ ]] && (( free >= 32 * MIB ))
 }
 
 esp_menu() {
-    local disk=$1 part type size free
+    local disk=$1 part type size free identity partitions
+    partitions=$(lsblk -nrpo NAME,PARTTYPE,TYPE "$disk" 2>/dev/null) || return 1
+    partitions=$(awk '$3=="part" {print $1 "\t" $2}' <<<"$partitions") || return 1
     while IFS=$'\t' read -r part type; do
         [[ -n $part ]] || continue
         is_reusable_esp "$part" "$type" || continue
-        size=$(lsblk -dnro SIZE "$part")
-        free=$(esp_free_bytes "$part")
-        printf '%s\t%s, %d MiB free\n' "$part" "$size" "$((free / MIB))"
-    done < <(lsblk -nrpo NAME,PARTTYPE,TYPE "$disk" | awk '$3=="part" {print $1 "\t" $2}')
+        size=$(lsblk -dnro SIZE "$part") || continue
+        free=$(esp_free_bytes "$part") || continue
+        identity=$(partition_identity "$part") || continue
+        printf '%s\t%s, %d MiB free\t%s\n' "$part" "$size" "$((free / MIB))" "$identity"
+    done <<<"$partitions"
 }
 
 describe_partitions() {
-    local disk=$1 excluded=${2:-} rows
-    rows=$(parted_rows "$disk" | awk -F: -v excluded="$excluded" \
-        '$1 != excluded {printf "  #%s %s-%s %s %s\n",$1,$2,$3,$4,$6}')
+    local disk=$1 excluded=${2:-} table rows
+    table=$(parted_rows "$disk") || return 1
+    rows=$(awk -F: -v excluded="$excluded" \
+        '$1 != excluded {printf "  #%s %s-%s %s %s\n",$1,$2,$3,$4,$6}' <<<"$table") || return 1
     printf '%s' "${rows:-  (none)}"
 }
 
@@ -438,27 +717,56 @@ prompt_validated() {
     done
 }
 
-collect_identity() {
-    prompt_validated LOCALE valid_locale "Locale" "Locale (UTF-8 recommended):" "$LOCALE"
+valid_password_hash() {
+    [[ $1 =~ ^\$6\$[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}$ ]]
+}
+
+hash_password() {
+    local hash
+    hash=$(printf '%s' "$1" | openssl passwd -6 -stdin 2>/dev/null) || return 1
+    valid_password_hash "$hash" || return 1
+    printf '%s\n' "$hash"
+}
+
+collect_password_hash() {
+    local password confirm hash
     while :; do
-        ask_value TIMEZONE --title "Timezone" --inputbox "Timezone (for example Europe/Berlin):" 10 72 "$TIMEZONE"
-        [[ $TIMEZONE != /* && $TIMEZONE != *..* && -f /usr/share/zoneinfo/$TIMEZONE ]] && break
-        dialog_message "That timezone is not present on the live media."
-    done
-    prompt_validated KEYMAP valid_layout "Console keymap" "Console keymap:" "$KEYMAP"
-    prompt_validated XKB_LAYOUT valid_layout "Keyboard layout" "XKB layout for Hyprland:" "$XKB_LAYOUT"
-    prompt_validated HOSTNAME valid_hostname "Hostname" "Hostname:" "$HOSTNAME"
-    prompt_validated USERNAME valid_username "User" "Login name (wheel and video groups):" "user"
-    while :; do
-        ask_value USER_PASSWORD --title "User password" --insecure --passwordbox \
-            "Password for $USERNAME (minimum 8 characters):" 10 72
-        ((${#USER_PASSWORD} >= 8)) || { dialog_message "Use at least 8 characters."; continue; }
-        local confirm=""
-        ask_value confirm --title "Confirm password" --insecure --passwordbox \
-            "Repeat the password for $USERNAME:" 10 72
-        [[ $USER_PASSWORD == "$confirm" ]] && break
+        password=$(ask --title "User password" --insecure --passwordbox \
+            "Password for $USERNAME (minimum 8 characters):" 10 72) || return 1
+        ((${#password} >= 8)) || {
+            dialog_message "Use at least 8 characters."
+            continue
+        }
+        confirm=$(ask --title "Confirm password" --insecure --passwordbox \
+            "Repeat the password for $USERNAME:" 10 72) || return 1
+        [[ $password == "$confirm" ]] && break
         dialog_message "Passwords did not match."
     done
+    hash=$(hash_password "$password") || return 1
+    unset password confirm
+    printf '%s\n' "$hash"
+}
+
+collect_identity() {
+    prompt_validated LOCALE supported_locale "Locale" "Supported UTF-8 locale (for example en_US.UTF-8):" "$LOCALE"
+    while :; do
+        ask_value TIMEZONE --title "Timezone" --inputbox "Timezone (for example Europe/Berlin):" 10 72 "$TIMEZONE"
+        valid_timezone "$TIMEZONE" && break
+        dialog_message "That timezone is not present on the live media."
+    done
+    prompt_validated KEYMAP supported_keymap "Console keymap" "Console keymap:" "$KEYMAP"
+    if [[ $PROFILE == desktop ]]; then
+        prompt_validated XKB_LAYOUT valid_layout "Keyboard layout" "XKB layout for Hyprland:" "$XKB_LAYOUT"
+    fi
+    prompt_validated HOSTNAME valid_hostname "Hostname" "Hostname:" "$HOSTNAME"
+    prompt_validated USERNAME available_username "User" "New login name (wheel and video groups):" "user"
+    if (( DRY_RUN )); then
+        USER_PASSWORD_HASH=""
+        ROOT_SAME_PASSWORD=0
+        return
+    fi
+    USER_PASSWORD_HASH=$(collect_password_hash) ||
+        die "Password entry was cancelled or could not be hashed safely."
     if ask_yesno --title "Root account" --defaultno --yesno \
         "Set root to the same password as $USERNAME?\n\nNo keeps root locked; wheel can use sudo." 11 72; then
         ROOT_SAME_PASSWORD=1
@@ -468,17 +776,30 @@ collect_identity() {
 }
 
 choose_safe_disk() {
-    local __var=$1 title=$2 rows=() disk description
-    while IFS=$'\t' read -r disk description; do
-        [[ -n $disk ]] && rows+=("$disk" "$description")
-    done < <(disk_menu)
+    local __var=$1 title=$2 rows=() menu disk description sequence bytes sector_size selected
+    local -A sequences=() byte_sizes=() sector_sizes=()
+    build_protected_disks || die "Storage devices could not be enumerated safely."
+    menu=$(disk_menu) || die "Storage devices could not be enumerated safely."
+    while IFS=$'\t' read -r disk description sequence bytes sector_size; do
+        [[ -n $disk ]] || continue
+        rows+=("$disk" "$description")
+        sequences["$disk"]=$sequence
+        byte_sizes["$disk"]=$bytes
+        sector_sizes["$disk"]=$sector_size
+    done <<<"$menu"
     ((${#rows[@]})) || die "No unmounted, writable, non-live, plain disks are available."
     ask_value "$__var" --title "$title" --menu "Select a target disk:" 18 78 10 "${rows[@]}"
+    selected=${!__var}
+    ORIGINAL_DISKSEQ=${sequences[$selected]:-}
+    ORIGINAL_DISK_BYTES=${byte_sizes[$selected]:-0}
+    ORIGINAL_SECTOR_SIZE=${sector_sizes[$selected]:-0}
+    SECTOR_SIZE=$ORIGINAL_SECTOR_SIZE
+    build_protected_disks || die "Storage devices could not be enumerated safely."
+    disk_state_still_valid && safe_disk "$selected" ||
+        die "The selected disk changed while the menu was open."
 }
 
 plan_whole_layout() {
-    SECTOR_SIZE=$(blockdev --getss "$1")
-    ORIGINAL_DISK_BYTES=$(blockdev --getsize64 "$1")
     GAP_START=$((MIB / SECTOR_SIZE))
     ROOT_START=$((GAP_START + GIB / SECTOR_SIZE))
     ROOT_END=$((ORIGINAL_DISK_BYTES / SECTOR_SIZE - (16384 + SECTOR_SIZE - 1) / SECTOR_SIZE - 2))
@@ -489,7 +810,7 @@ plan_whole_layout() {
 choose_whole_disk() {
     MODE=whole
     choose_safe_disk DISK "Erase a whole disk"
-    plan_whole_layout "$DISK"
+    plan_whole_layout
     ESP_ACTION=create
     ESP_PART=$(partition_name "$DISK" 1)
     ROOT_PART=$(partition_name "$DISK" 2)
@@ -497,14 +818,20 @@ choose_whole_disk() {
 }
 
 choose_esp() {
-    local disk=$1 required=$2 rows=() part description
-    while IFS=$'\t' read -r part description; do
-        [[ -n $part ]] && rows+=("$part" "$description")
-    done < <(esp_menu "$disk")
+    local disk=$1 required=$2 rows=() part description identity menu
+    local -A identities=()
+    build_protected_disks || die "Storage devices could not be enumerated safely."
+    menu=$(esp_menu "$disk") || die "EFI System Partitions could not be enumerated safely."
+    while IFS=$'\t' read -r part description identity; do
+        [[ -n $part ]] || continue
+        rows+=("$part" "$description")
+        identities["$part"]=$identity
+    done <<<"$menu"
     if ((${#rows[@]} == 0)); then
         [[ $required == allow-create ]] || die "No same-disk FAT ESP with at least 32 MiB free is reusable."
         ESP_ACTION=create
         ESP_PART="(new 1 GiB ESP)"
+        ORIGINAL_ESP_ID=""
         return
     fi
     if [[ $required == allow-create ]]; then
@@ -515,33 +842,40 @@ choose_esp() {
     if [[ $part == CREATE ]]; then
         ESP_ACTION=create
         ESP_PART="(new 1 GiB ESP)"
+        ORIGINAL_ESP_ID=""
     else
         ESP_ACTION=reuse
         ESP_PART=$part
+        ORIGINAL_ESP_ID=${identities[$part]:-}
+        build_protected_disks || die "Storage devices could not be enumerated safely."
+        disk_state_still_valid && is_reusable_esp "$ESP_PART" &&
+            [[ $(partition_identity "$ESP_PART") == "$ORIGINAL_ESP_ID" ]] ||
+            die "The selected EFI System Partition changed while the menu was open."
     fi
 }
 
 choose_unallocated() {
-    local min_mib min_bytes esp_sectors required_sectors start end sectors rows=() label choice
+    local min_mib min_bytes esp_sectors required_sectors start end sectors rows=() label choice extents aligned
     MODE=unallocated
     choose_safe_disk DISK "Use unallocated disk space"
-    ORIGINAL_DISK_BYTES=$(blockdev --getsize64 "$DISK")
     disk_is_gpt "$DISK" || die "Coexistence requires an existing GPT disk label."
     choose_esp "$DISK" allow-create
-    SECTOR_SIZE=$(blockdev --getss "$DISK")
     min_mib=$(minimum_root_mib "$PROFILE")
     min_bytes=$((min_mib * MIB))
     esp_sectors=0
     [[ $ESP_ACTION == create ]] && esp_sectors=$((GIB / SECTOR_SIZE))
     required_sectors=$(( (min_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE + esp_sectors ))
+    extents=$(free_extents "$DISK") || die "Unallocated space could not be enumerated safely."
     while read -r start end sectors; do
+        aligned=$(aligned_extent "$start" "$end" "$SECTOR_SIZE") || continue
+        read -r start end sectors <<<"$aligned"
         (( sectors >= required_sectors )) || continue
         label="sectors $start-$end ($((sectors * SECTOR_SIZE / MIB)) MiB)"
         rows+=("$start:$end" "$label")
-    done < <(free_extents "$DISK")
+    done <<<"$extents"
     ((${#rows[@]})) || die "No unallocated extent can hold the selected profile and ESP plan."
     ask_value choice --title "Unallocated extent" --menu \
-        "No neighboring partition will be resized. Choose one exact free extent:" 18 78 10 "${rows[@]}"
+        "No neighboring partition will be resized. Choose one aligned usable range:" 18 78 10 "${rows[@]}"
     GAP_START=${choice%:*}
     GAP_END=${choice#*:}
     ROOT_START=$((GAP_START + esp_sectors))
@@ -549,58 +883,97 @@ choose_unallocated() {
     ROOT_BYTES=$(((ROOT_END - ROOT_START + 1) * SECTOR_SIZE))
     ORIGINAL_ROOT_BYTES=$ROOT_BYTES
     ROOT_PART="(new partition)"
-    PRESERVED=$(describe_partitions "$DISK")
+    PRESERVED=$(describe_partitions "$DISK") || die "The preserved partition list could not be read safely."
 }
 
 ordinary_linux_partition() {
-    local part=$1 type fstype parent
-    [[ -b $part && $(lsblk -dnro TYPE "$part") == part ]] || return 1
-    [[ -z $(lsblk -nro MOUNTPOINTS "$part" | awk 'NF {print; exit}') ]] || return 1
+    local part=$1 type parent mounts ro
+    [[ -b $part ]] || return 1
+    type=$(lsblk -dnro TYPE "$part") || return 1
+    [[ $type == part ]] || return 1
+    mounts=$(lsblk -nro MOUNTPOINTS "$part" 2>/dev/null) || return 1
+    [[ ! $mounts =~ [^[:space:]] ]] || return 1
+    ro=$(blockdev --getro "$part" 2>/dev/null) || return 1
+    [[ $ro == 0 ]] || return 1
     type=$(lsblk -dnro PARTTYPE "$part")
     [[ ${type,,} == "$LINUX_GUID" ]] || return 1
-    fstype=$(blkid -s TYPE -o value "$part" 2>/dev/null || true)
-    case $fstype in LVM2_member|linux_raid_member|crypto_LUKS|swap) return 1 ;; esac
-    parent=$(parent_disk "$part" 2>/dev/null || true)
-    [[ -n $parent ]] && safe_disk "$parent"
+    has_complex_signature "$part" 1 && return 1
+    parent=$(parent_disk "$part" 2>/dev/null) || return 1
+    safe_disk "$parent"
 }
 
 replace_menu() {
-    local disk part size fstype
-    while IFS= read -r disk; do
+    local disks disk disk_type state sequence bytes sector_size esp_options partitions
+    local part part_type size fstype root_identity root_bytes final_state
+    disks=$(lsblk -dnpo NAME,TYPE 2>/dev/null) || return 1
+    while read -r disk disk_type; do
+        [[ $disk_type == disk ]] || continue
         safe_disk "$disk" || continue
         disk_is_gpt "$disk" || continue
-        [[ -n $(esp_menu "$disk") ]] || continue
-        while IFS= read -r part; do
+        state=$(disk_state "$disk") || continue
+        read -r sequence bytes sector_size <<<"$state"
+        esp_options=$(esp_menu "$disk") || return 1
+        [[ -n $esp_options ]] || continue
+        partitions=$(lsblk -nrpo NAME,TYPE "$disk" 2>/dev/null) || return 1
+        while read -r part part_type; do
+            [[ $part_type == part ]] || continue
             ordinary_linux_partition "$part" || continue
-            size=$(lsblk -dnro SIZE "$part")
-            fstype=$(blkid -s TYPE -o value "$part" 2>/dev/null || true)
-            printf '%s\t%s on %s (%s)\n' "$part" "$size" "$disk" "${fstype:-unknown filesystem}"
-        done < <(lsblk -nrpo NAME,TYPE "$disk" | awk '$2=="part" {print $1}')
-    done < <(lsblk -dnpo NAME,TYPE | awk '$2=="disk" {print $1}')
+            size=$(lsblk -dnro SIZE "$part") || continue
+            root_bytes=$(blockdev --getsize64 "$part") || continue
+            root_identity=$(partition_identity "$part") || continue
+            fstype=$(blkid -p -s TYPE -o value "$part" 2>/dev/null || true)
+            printf '%s\t%s on %s (%s)\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$part" "$size" "$disk" "${fstype:-unknown filesystem}" "$disk" \
+                "$sequence" "$bytes" "$sector_size" "$root_identity" "$root_bytes"
+        done <<<"$partitions"
+        final_state=$(disk_state "$disk") || return 1
+        [[ $final_state == "$state" ]] || return 1
+    done <<<"$disks"
 }
 
 choose_replace() {
-    local rows=() part description min_mib part_number
+    local rows=() menu part description disk sequence bytes sector_size root_identity root_bytes min_mib part_number
+    local -A disks=() sequences=() byte_sizes=() sector_sizes=() root_ids=() root_byte_sizes=()
     MODE=replace
-    while IFS=$'\t' read -r part description; do
-        [[ -n $part ]] && rows+=("$part" "$description")
-    done < <(replace_menu)
+    build_protected_disks || die "Storage devices could not be enumerated safely."
+    menu=$(replace_menu) || die "Replaceable partitions could not be enumerated safely."
+    while IFS=$'\t' read -r part description disk sequence bytes sector_size root_identity root_bytes; do
+        [[ -n $part ]] || continue
+        rows+=("$part" "$description")
+        disks["$part"]=$disk
+        sequences["$part"]=$sequence
+        byte_sizes["$part"]=$bytes
+        sector_sizes["$part"]=$sector_size
+        root_ids["$part"]=$root_identity
+        root_byte_sizes["$part"]=$root_bytes
+    done <<<"$menu"
     ((${#rows[@]})) || die "No safe ordinary Linux partition with a reusable same-disk ESP is available."
     ask_value ROOT_PART --title "Replace one partition" --menu \
         "Only the selected partition will be formatted as Btrfs:" 18 78 10 "${rows[@]}"
-    ordinary_linux_partition "$ROOT_PART" || die "The selected partition is no longer safe."
-    DISK=$(parent_disk "$ROOT_PART")
-    ORIGINAL_DISK_BYTES=$(blockdev --getsize64 "$DISK")
-    choose_esp "$DISK" must-reuse
-    ROOT_BYTES=$(blockdev --getsize64 "$ROOT_PART")
+    DISK=${disks[$ROOT_PART]:-}
+    ORIGINAL_DISKSEQ=${sequences[$ROOT_PART]:-}
+    ORIGINAL_DISK_BYTES=${byte_sizes[$ROOT_PART]:-0}
+    ORIGINAL_SECTOR_SIZE=${sector_sizes[$ROOT_PART]:-0}
+    SECTOR_SIZE=$ORIGINAL_SECTOR_SIZE
+    ORIGINAL_ROOT_ID=${root_ids[$ROOT_PART]:-}
+    ROOT_BYTES=${root_byte_sizes[$ROOT_PART]:-0}
     ORIGINAL_ROOT_BYTES=$ROOT_BYTES
+    build_protected_disks || die "Storage devices could not be enumerated safely."
+    disk_state_still_valid && ordinary_linux_partition "$ROOT_PART" &&
+        [[ $(partition_identity "$ROOT_PART") == "$ORIGINAL_ROOT_ID" ]] &&
+        [[ $(blockdev --getsize64 "$ROOT_PART") == "$ORIGINAL_ROOT_BYTES" ]] ||
+        die "The selected root partition changed while the menu was open."
     min_mib=$(minimum_root_mib "$PROFILE")
     root_size_ok "$ROOT_BYTES" "$PROFILE" || die "The selected root partition is smaller than ${min_mib} MiB."
-    part_number=$(lsblk -dnro PARTN "$ROOT_PART")
-    PRESERVED=$(describe_partitions "$DISK" "$part_number")
+    choose_esp "$DISK" must-reuse
+    part_number=$(lsblk -dnro PARTN "$ROOT_PART") || die "The root partition number could not be read."
+    PRESERVED=$(describe_partitions "$DISK" "$part_number") ||
+        die "The preserved partition list could not be read safely."
 }
 
 collect_storage() {
+    ORIGINAL_ROOT_ID=""
+    ORIGINAL_ESP_ID=""
     ask_value MODE --title "Storage workflow" --default-item whole --menu \
         "Choose how target storage is allocated:" 15 78 3 \
         whole "Erase one whole non-live disk" \
@@ -614,53 +987,75 @@ collect_storage() {
     local min_mib
     min_mib=$(minimum_root_mib "$PROFILE")
     root_size_ok "$ROOT_BYTES" "$PROFILE" || die "Root must be at least ${min_mib} MiB for this profile."
+    storage_plan_still_valid || die "Storage changed while the installation plan was being built."
 }
 
 collect_swap() {
-    local recommended maximum value root_mib=$((ROOT_BYTES / MIB))
+    local recommended maximum value normalized root_mib=$((ROOT_BYTES / MIB))
     read -r recommended maximum < <(swap_limits "$RAM_MIB" "$root_mib" "$PROFILE")
     while :; do
         ask_value value --title "Swap file" --inputbox \
             "Non-hibernation Btrfs swap in MiB.\nRecommended: $recommended MiB\nAllowed: 0-$maximum MiB\n\nThe cap preserves build and base-system space." \
             14 72 "$recommended"
-        [[ $value =~ ^[0-9]+$ ]] && (( value <= maximum )) && { SWAP_MIB=$value; return; }
+        if normalized=$(bounded_uint "$value" "$maximum"); then
+            SWAP_MIB=$normalized
+            return
+        fi
         dialog_message "Enter a whole number from 0 through $maximum."
     done
 }
 
+target_has_mounts() {
+    local mount mounts
+    mounts=$(findmnt -rn -o TARGET 2>/dev/null) || return 0
+    while IFS= read -r mount; do
+        [[ $mount == "$TARGET" || $mount == "$TARGET/"* ]] && return 0
+    done <<<"$mounts"
+    return 1
+}
+
 storage_plan_still_valid() {
-    local start end sectors found=0
-    [[ ! -L $TARGET ]] || return 1
-    ! mountpoint -q "$TARGET" || return 1
+    local start end sectors found=0 extents root_size
+    [[ ! -e $TARGET || ( -d $TARGET && ! -L $TARGET ) ]] || return 1
+    ! target_has_mounts || return 1
+    build_protected_disks || return 1
     safe_disk "$DISK" || return 1
-    (( $(blockdev --getsize64 "$DISK") == ORIGINAL_DISK_BYTES )) || return 1
+    disk_state_still_valid || return 1
     case $MODE in
-        whole)
-            (( ROOT_BYTES == ORIGINAL_ROOT_BYTES ))
-            ;;
+        whole) ;;
         unallocated)
             disk_is_gpt "$DISK" || return 1
+            extents=$(free_extents "$DISK") || return 1
             while read -r start end sectors; do
-                [[ $start == "$GAP_START" && $end == "$GAP_END" ]] && found=1
-            done < <(free_extents "$DISK")
+                (( start <= GAP_START && end >= GAP_END )) && found=1
+            done <<<"$extents"
             (( found )) || return 1
-            [[ $ESP_ACTION == create ]] || is_reusable_esp "$ESP_PART"
+            [[ $ESP_ACTION == create ]] || {
+                is_reusable_esp "$ESP_PART" &&
+                    [[ $(partition_identity "$ESP_PART") == "$ORIGINAL_ESP_ID" ]]
+            }
             ;;
         replace)
+            root_size=$(blockdev --getsize64 "$ROOT_PART") || return 1
             ordinary_linux_partition "$ROOT_PART" &&
-                (( $(blockdev --getsize64 "$ROOT_PART") == ORIGINAL_ROOT_BYTES )) &&
-                is_reusable_esp "$ESP_PART"
+                [[ $root_size == "$ORIGINAL_ROOT_BYTES" ]] &&
+                [[ $(partition_identity "$ROOT_PART") == "$ORIGINAL_ROOT_ID" ]] &&
+                is_reusable_esp "$ESP_PART" &&
+                [[ $(partition_identity "$ESP_PART") == "$ORIGINAL_ESP_ID" ]]
             ;;
+        *) return 1 ;;
     esac
 }
 
 plan_summary() {
-    local root_target=$ROOT_PART esp_text gpu_note="" part_number row
+    local root_target=$ROOT_PART esp_text gpu_note="" part_number row table
     if [[ $MODE == whole ]]; then
         root_target="$ROOT_PART (new), sectors $ROOT_START-$ROOT_END"
     elif [[ $MODE == replace ]]; then
-        part_number=$(lsblk -dnro PARTN "$ROOT_PART")
-        row=$(parted_rows "$DISK" | awk -F: -v n="$part_number" '$1==n {print $2 "-" $3; exit}')
+        part_number=$(lsblk -dnro PARTN "$ROOT_PART") || return 1
+        table=$(parted_rows "$DISK") || return 1
+        row=$(awk -F: -v n="$part_number" '$1==n {print $2 "-" $3; exit}' <<<"$table") || return 1
+        [[ -n $row ]] || return 1
         root_target="$ROOT_PART, sectors $row"
     fi
     [[ $MODE == unallocated ]] && root_target="new partition, sectors $ROOT_START-$ROOT_END"
@@ -692,11 +1087,12 @@ EOF
 review_and_confirm() {
     local summary phrase entered
     summary=$(plan_summary)
-    dialog --title "Final installation plan" --scrollbar --msgbox "$summary" 24 90
+    dialog --title "Final installation plan" --scrollbar --msgbox "$summary" 24 90 ||
+        die "Installation cancelled before any target write."
     if (( DRY_RUN )); then
         dialog_message "Dry run complete. No download, mount, format, partition, or chroot action was executed.\n\nLog: $LOG"
         log "Dry run completed with zero target writes"
-        return 1
+        return 0
     fi
     phrase=$(confirmation_phrase "$MODE" "$([[ $MODE == replace ]] && printf '%s' "$ROOT_PART" || printf '%s' "$DISK")")
     ask_value entered --title "Destructive confirmation" --inputbox \
@@ -707,17 +1103,94 @@ review_and_confirm() {
 }
 
 part_number_at_start() {
-    local disk=$1 wanted=$2 number start
+    local disk=$1 wanted=$2 number start table
+    table=$(parted_rows "$disk") || return 1
     while IFS=: read -r number start _; do
         start=${start%s}
         [[ $start == "$wanted" ]] && { printf '%s' "$number"; return 0; }
-    done < <(parted_rows "$disk")
+    done <<<"$table"
     return 1
 }
 
 settle_partitions() {
     run partprobe "$1"
     run udevadm settle
+}
+
+planned_partition_matches() {
+    local part=$1 expected_start=$2 expected_end=$3 expected_guid=$4
+    local identity parent uuid actual_start actual_sectors type ro mounts topology scale
+    [[ $expected_start =~ ^[0-9]+$ && $expected_end =~ ^[0-9]+$ ]] || return 1
+    (( expected_end >= expected_start && SECTOR_SIZE % 512 == 0 )) || return 1
+    identity=$(partition_identity "$part") || return 1
+    IFS='|' read -r parent uuid actual_start actual_sectors <<<"$identity"
+    [[ $parent == "$DISK" && -n $uuid ]] || return 1
+    type=$(lsblk -dnro PARTTYPE "$part") || return 1
+    [[ ${type,,} == "$expected_guid" ]] || return 1
+    ro=$(blockdev --getro "$part" 2>/dev/null) || return 1
+    [[ $ro == 0 ]] || return 1
+    mounts=$(lsblk -nro MOUNTPOINTS "$part" 2>/dev/null) || return 1
+    [[ ! $mounts =~ [^[:space:]] ]] || return 1
+    topology=$(lsblk -nrpo TYPE "$part" 2>/dev/null) || return 1
+    [[ $topology == part ]] || return 1
+    scale=$((SECTOR_SIZE / 512))
+    (( actual_start == expected_start * scale &&
+        actual_sectors == (expected_end - expected_start + 1) * scale ))
+}
+
+partition_matches_identity() {
+    local part=$1 expected_identity=$2 expected_guid=$3 identity parent uuid start sectors type ro mounts topology
+    identity=$(partition_identity "$part") || return 1
+    [[ $identity == "$expected_identity" ]] || return 1
+    IFS='|' read -r parent uuid start sectors <<<"$identity"
+    [[ $parent == "$DISK" && -n $uuid ]] || return 1
+    type=$(lsblk -dnro TYPE "$part") || return 1
+    [[ $type == part ]] || return 1
+    type=$(lsblk -dnro PARTTYPE "$part") || return 1
+    [[ ${type,,} == "$expected_guid" ]] || return 1
+    ro=$(blockdev --getro "$part" 2>/dev/null) || return 1
+    [[ $ro == 0 ]] || return 1
+    mounts=$(lsblk -nro MOUNTPOINTS "$part" 2>/dev/null) || return 1
+    [[ ! $mounts =~ [^[:space:]] ]] || return 1
+    topology=$(lsblk -nrpo TYPE "$part" 2>/dev/null) || return 1
+    [[ $topology == part ]]
+}
+
+ordinary_partition_matches_identity() {
+    local part=$1 expected_identity=$2
+    partition_matches_identity "$part" "$expected_identity" "$LINUX_GUID" || return 1
+    ! has_complex_signature "$part" 1
+}
+
+format_targets_still_valid() {
+    local disk_ro root_size
+    disk_state_still_valid || return 1
+    build_protected_disks || return 1
+    [[ -z ${PROTECTED_DISKS[$DISK]:-} ]] || return 1
+    disk_ro=$(blockdev --getro "$DISK" 2>/dev/null) || return 1
+    [[ $disk_ro == 0 ]] || return 1
+    ! disk_has_mounts "$DISK" || return 1
+    [[ $ROOT_PART != "$ESP_PART" ]] || return 1
+    case $MODE in
+        whole|unallocated)
+            planned_partition_matches "$ROOT_PART" "$ROOT_START" "$ROOT_END" "$LINUX_GUID" || return 1
+            if [[ $ESP_ACTION == create ]]; then
+                planned_partition_matches "$ESP_PART" "$GAP_START" "$((ROOT_START - 1))" "$ESP_GUID"
+            else
+                is_reusable_esp "$ESP_PART" &&
+                    [[ $(partition_identity "$ESP_PART") == "$ORIGINAL_ESP_ID" ]]
+            fi
+            ;;
+        replace)
+            root_size=$(blockdev --getsize64 "$ROOT_PART") || return 1
+            ordinary_partition_matches_identity "$ROOT_PART" "$ORIGINAL_ROOT_ID" &&
+                [[ $root_size == "$ORIGINAL_ROOT_BYTES" ]] &&
+                partition_matches_identity "$ESP_PART" "$ORIGINAL_ESP_ID" "$ESP_GUID" &&
+                is_reusable_esp "$ESP_PART" &&
+                [[ $(partition_identity "$ESP_PART") == "$ORIGINAL_ESP_ID" ]]
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 setup_storage() {
@@ -738,35 +1211,41 @@ setup_storage() {
                 esp_end=$((ROOT_START - 1))
                 run parted -s -a none "$DISK" unit s mkpart "Gentoo ESP" fat32 "${GAP_START}s" "${esp_end}s"
                 settle_partitions "$DISK"
-                number=$(part_number_at_start "$DISK" "$GAP_START")
+                number=$(part_number_at_start "$DISK" "$GAP_START") ||
+                    die "The new EFI System Partition could not be identified."
                 ESP_PART=$(partition_name "$DISK" "$number")
                 run parted -s "$DISK" set "$number" esp on
             fi
             run parted -s -a none "$DISK" unit s mkpart "Gentoo root" btrfs "${ROOT_START}s" "${ROOT_END}s"
             settle_partitions "$DISK"
-            number=$(part_number_at_start "$DISK" "$ROOT_START")
+            number=$(part_number_at_start "$DISK" "$ROOT_START") ||
+                die "The new root partition could not be identified."
             ROOT_PART=$(partition_name "$DISK" "$number")
             ;;
         replace) ;;
     esac
     [[ -b $ROOT_PART ]] || die "The new root partition did not appear."
     [[ -b $ESP_PART ]] || die "The EFI System Partition did not appear."
-    [[ $ESP_ACTION == create ]] && run mkfs.fat -F 32 -n GENTOOEFI "$ESP_PART"
+    format_targets_still_valid || die "Created storage no longer matches the confirmed plan; formatting was stopped."
+    if [[ $ESP_ACTION == create ]]; then
+        run wipefs -af "$ESP_PART"
+        run mkfs.fat -F 32 -n GENTOOEFI "$ESP_PART"
+    fi
     run wipefs -af "$ROOT_PART"
     run mkfs.btrfs -f -L Gentoo "$ROOT_PART"
 }
 
 mount_layout() {
     run mkdir -p "$TARGET"
-    run mount -o noatime,compress=zstd:1 "$ROOT_PART" "$TARGET"
     TARGET_ACTIVE=1
+    run mount -o noatime,compress=zstd:1 "$ROOT_PART" "$TARGET"
     run btrfs subvolume create "$TARGET/@"
     run btrfs subvolume create "$TARGET/@home"
     (( SWAP_MIB == 0 )) || run btrfs subvolume create "$TARGET/@swap"
     run umount "$TARGET"
     TARGET_ACTIVE=0
-    run mount -o noatime,compress=zstd:1,subvol=@ "$ROOT_PART" "$TARGET"
     TARGET_ACTIVE=1
+    run mount -o noatime,compress=zstd:1,subvol=@ "$ROOT_PART" "$TARGET"
     run mkdir -p "$TARGET/home" "$TARGET/efi"
     run mount -o noatime,compress=zstd:1,subvol=@home "$ROOT_PART" "$TARGET/home"
     if (( SWAP_MIB )); then
@@ -776,42 +1255,89 @@ mount_layout() {
         run btrfs filesystem mkswapfile --size "${SWAP_MIB}m" "$OUR_SWAP"
         run swapon "$OUR_SWAP"
     fi
-    run mount -o umask=0077 "$ESP_PART" "$TARGET/efi"
+    run mount -o umask=0077,nodev,nosuid,noexec "$ESP_PART" "$TARGET/efi"
+}
+
+stage_pointer_entry() {
+    local stage=$1 entry=$2 path size extra timestamp filename
+    read -r path size extra <<<"$entry" || return 1
+    timestamp=${path%%/*}
+    filename=${path#*/}
+    [[ -z ${extra:-} && $timestamp =~ ^[0-9]{8}T[0-9]{6}Z$ &&
+        $filename == "$stage-$timestamp.tar.xz" && $size =~ ^[1-9][0-9]*$ &&
+        ${#size} -le 18 ]] || return 1
+    printf '%s %s\n' "$path" "$size"
+}
+
+sha512_digest() {
+    awk -v file="$2" '
+        $0 == "# SHA512 HASH" { section=1; next }
+        /^#/ { section=0 }
+        section && $2 == file { print $1; exit }
+    ' "$1"
 }
 
 stage_pointer_url() {
     local stage
     [[ $PROFILE == desktop ]] && stage=stage3-amd64-desktop-openrc || stage=stage3-$ARCH-openrc
-    printf 'https://distfiles.gentoo.org/releases/%s/autobuilds/current-%s/latest-%s.txt' "$ARCH" "$stage" "$stage"
+    printf 'https://distfiles.gentoo.org/releases/%s/autobuilds/latest-%s.txt' "$ARCH" "$stage"
 }
 
-download_and_extract_stage() {
-    local pointer_url stage filename timestamp base expected actual pointer_size
-    WORKDIR=$(mktemp -d /tmp/autogentoo-stage.XXXXXX)
+prepare_stage_metadata() {
+    local pointer_url stage entry filename keyring verified_pointer verified_digests
+    WORKDIR=$(mktemp -d /tmp/autogentoo-metadata.XXXXXX)
     pointer_url=$(stage_pointer_url)
     stage=${pointer_url##*/latest-}
     stage=${stage%.txt}
-    run curl --proto '=https' --tlsv1.2 --fail --location --show-error \
+    keyring="$WORKDIR/gentoo-release.gpg"
+    verified_pointer="$WORKDIR/latest.verified"
+    run gpg --no-options --batch --yes --dearmor --output "$keyring" "$GENTOO_KEY"
+    run curl --disable --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
+        --show-error --remove-on-error --max-filesize "$MIB" \
         --output "$WORKDIR/latest.txt" "$pointer_url"
-    run gpgv --keyring "$GENTOO_KEY" "$WORKDIR/latest.txt"
-    read -r filename pointer_size < <(awk '/^stage3-.*\.tar\.xz [0-9]+$/ {print; exit}' "$WORKDIR/latest.txt")
-    [[ $filename == "$stage"-*.tar.xz && $pointer_size =~ ^[0-9]+$ ]] ||
+    run gpgv --homedir "$WORKDIR" --output "$verified_pointer" --keyring "$keyring" \
+        "$WORKDIR/latest.txt"
+    entry=$(awk 'NF == 2 && $1 ~ /\.tar\.xz$/ && $2 ~ /^[0-9]+$/ {print; exit}' \
+        "$verified_pointer")
+    entry=$(stage_pointer_entry "$stage" "$entry") ||
         die "The signed stage pointer did not name the expected $stage archive."
-    timestamp=${filename%.tar.xz}
-    timestamp=${timestamp##*-}
-    [[ $timestamp =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || die "The signed stage timestamp is invalid."
-    base="https://distfiles.gentoo.org/releases/$ARCH/autobuilds/$timestamp/$filename"
-    run curl --proto '=https' --tlsv1.2 --fail --location --show-error --output "$WORKDIR/$filename" "$base"
-    run curl --proto '=https' --tlsv1.2 --fail --location --show-error --output "$WORKDIR/$filename.asc" "$base.asc"
-    run curl --proto '=https' --tlsv1.2 --fail --location --show-error --output "$WORKDIR/$filename.DIGESTS" "$base.DIGESTS"
-    run gpgv --keyring "$GENTOO_KEY" "$WORKDIR/$filename.asc" "$WORKDIR/$filename"
-    run gpgv --keyring "$GENTOO_KEY" "$WORKDIR/$filename.DIGESTS"
-    actual=$(stat -c %s "$WORKDIR/$filename")
-    (( actual == pointer_size )) || die "The stage size does not match its signed pointer."
-    expected=$(awk -v file="$filename" '$2==file && length($1)==128 {print $1; exit}' "$WORKDIR/$filename.DIGESTS")
-    [[ $expected =~ ^[0-9a-fA-F]{128}$ ]] || die "No signed SHA-512 checksum was found."
-    (cd "$WORKDIR" && printf '%s  %s\n' "$expected" "$filename" | sha512sum -c -) | tee -a "$LOG"
-    run tar xpf "$WORKDIR/$filename" --xattrs-include='*.*' --numeric-owner -C "$TARGET"
+    read -r STAGE_PATH STAGE_SIZE <<<"$entry"
+    filename=${STAGE_PATH##*/}
+    STAGE_BASE="https://distfiles.gentoo.org/releases/$ARCH/autobuilds/$STAGE_PATH"
+    run curl --disable --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
+        --show-error --remove-on-error --max-filesize "$MIB" \
+        --output "$WORKDIR/$filename.asc" "$STAGE_BASE.asc"
+    run curl --disable --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
+        --show-error --remove-on-error --max-filesize "$MIB" \
+        --output "$WORKDIR/$filename.DIGESTS" "$STAGE_BASE.DIGESTS"
+    verified_digests="$WORKDIR/$filename.DIGESTS.verified"
+    run gpgv --homedir "$WORKDIR" --output "$verified_digests" --keyring "$keyring" \
+        "$WORKDIR/$filename.DIGESTS"
+    STAGE_DIGEST=$(sha512_digest "$verified_digests" "$filename")
+    [[ $STAGE_DIGEST =~ ^[0-9a-fA-F]{128}$ ]] || die "No signed SHA-512 checksum was found."
+}
+
+download_and_extract_stage() {
+    local filename archive actual keyring
+    filename=${STAGE_PATH##*/}
+    keyring="$WORKDIR/gentoo-release.gpg"
+    [[ -n $filename && $STAGE_SIZE =~ ^[1-9][0-9]*$ && -n $STAGE_BASE &&
+        $STAGE_DIGEST =~ ^[0-9a-fA-F]{128}$ && -r $keyring && -r $WORKDIR/$filename.asc ]] ||
+        die "Verified stage metadata is incomplete."
+    STAGE_DIR=$(mktemp -d "$TARGET/.autogentoo-stage.XXXXXX")
+    archive="$STAGE_DIR/$filename"
+    run curl --disable --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --location \
+        --show-error --remove-on-error --max-filesize "$STAGE_SIZE" \
+        --output "$archive" "$STAGE_BASE"
+    run gpgv --homedir "$WORKDIR" --keyring "$keyring" "$WORKDIR/$filename.asc" "$archive"
+    actual=$(stat -c %s "$archive")
+    (( actual == STAGE_SIZE )) || die "The stage size does not match its signed pointer."
+    (cd "$STAGE_DIR" && printf '%s  %s\n' "$STAGE_DIGEST" "$filename" | sha512sum -c -) | tee -a "$LOG"
+    run tar xpf "$archive" --xattrs-include='*.*' --numeric-owner -C "$TARGET"
+    run rm -rf -- "$STAGE_DIR"
+    STAGE_DIR=""
+    run rm -rf -- "$WORKDIR"
+    WORKDIR=""
 }
 
 bind_chroot_filesystems() {
@@ -822,7 +1348,7 @@ bind_chroot_filesystems() {
     run mount --make-rslave "$TARGET/sys"
     run mount --rbind /run "$TARGET/run"
     run mount --make-rslave "$TARGET/run"
-    run cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf"
+    run cp -L --remove-destination /etc/resolv.conf "$TARGET/etc/resolv.conf"
 }
 
 write_make_conf() {
@@ -830,7 +1356,7 @@ write_make_conf() {
     jobs=$(jobs_for "$CPU_THREADS" "$RAM_MIB")
     load=$((jobs + 1))
     [[ $ARCH == amd64 ]] && native=-march=native || native=-mcpu=native
-    video_cards="amdgpu radeonsi intel"
+    video_cards="amdgpu radeonsi intel virgl"
     (( NVIDIA )) && video_cards+=" nvidia"
     cat >"$TARGET/etc/portage/make.conf" <<EOF
 COMMON_FLAGS="-O2 -pipe $native"
@@ -839,35 +1365,41 @@ CXXFLAGS="\${COMMON_FLAGS}"
 FCFLAGS="\${COMMON_FLAGS}"
 FFLAGS="\${COMMON_FLAGS}"
 MAKEOPTS="-j$jobs -l$load"
-GRUB_PLATFORMS="$([[ $ARCH == amd64 ]] && printf efi-64 || printf efi-arm64)"
+GRUB_PLATFORMS="efi-64"
 VIDEO_CARDS="$video_cards"
 EOF
+    chmod 0644 "$TARGET/etc/portage/make.conf"
     log "Portage tuning: $native jobs=$jobs load=$load"
 }
 
 write_system_configuration() {
     run mkdir -p "$TARGET/etc/portage/package.license" "$TARGET/etc/portage/package.use" \
-        "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/modprobe.d"
+        "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/modprobe.d" "$TARGET/etc/default"
     write_make_conf
     printf '%s UTF-8\n' "$LOCALE" >"$TARGET/etc/locale.gen"
     printf 'LANG="%s"\nLC_COLLATE="C.UTF-8"\n' "$LOCALE" >"$TARGET/etc/env.d/02locale"
-    printf 'TIMEZONE="%s"\n' "$TIMEZONE" >"$TARGET/etc/timezone"
+    printf '%s\n' "$TIMEZONE" >"$TARGET/etc/timezone"
     ln -sf "../usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
     printf 'hostname="%s"\n' "$HOSTNAME" >"$TARGET/etc/conf.d/hostname"
     printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost\n' "$HOSTNAME" >"$TARGET/etc/hosts"
     printf 'keymap="%s"\n' "$KEYMAP" >"$TARGET/etc/conf.d/keymaps"
     cat >"$TARGET/etc/portage/package.license/autogentoo" <<'EOF'
 sys-kernel/linux-firmware linux-fw-redistributable no-source-code
+sys-firmware/intel-microcode intel-ucode
 www-client/firefox-bin MPL-2.0 GPL-2 LGPL-2.1
 x11-drivers/nvidia-drivers NVIDIA-2025
 EOF
     printf 'GRUB_DISABLE_OS_PROBER=true\n' >"$TARGET/etc/default/grub"
+    chmod 0644 "$TARGET/etc/locale.gen" "$TARGET/etc/env.d/02locale" \
+        "$TARGET/etc/timezone" "$TARGET/etc/conf.d/hostname" "$TARGET/etc/hosts" \
+        "$TARGET/etc/conf.d/keymaps" "$TARGET/etc/portage/package.license/autogentoo" \
+        "$TARGET/etc/default/grub"
 }
 
 base_packages() {
     local packages=(
         sys-kernel/gentoo-kernel-bin sys-kernel/linux-firmware sys-kernel/dracut
-        sys-fs/btrfs-progs net-misc/networkmanager app-admin/sudo
+        sys-fs/btrfs-progs sys-fs/dosfstools net-misc/networkmanager app-admin/sudo
         sys-boot/grub sys-boot/efibootmgr app-admin/eselect
     )
     [[ $ARCH == amd64 && $CPU_VENDOR == GenuineIntel ]] && packages+=(sys-firmware/intel-microcode)
@@ -878,27 +1410,31 @@ install_base() {
     local packages=()
     mapfile -t packages < <(base_packages)
     chroot_run /usr/bin/emerge --sync
-    chroot_run /usr/bin/emerge --verbose --newuse "${packages[@]}"
+    chroot_run /usr/bin/emerge --verbose --update --deep --newuse @world "${packages[@]}"
     chroot_run /usr/sbin/locale-gen
     chroot_run /usr/bin/env-update
-    chroot_run /bin/bash -c "source /etc/profile; eselect locale set \"\$1\"" _ "$LOCALE"
     chroot_run /sbin/rc-update add NetworkManager default
     chroot_run /sbin/rc-update add dbus default
 }
 
 pin_repository() {
-    local name=$1 commit=$2 repo=/var/db/repos/$1
+    local name=$1 commit=$2 repo=/var/db/repos/$1 actual
     chroot_run /usr/bin/eselect repository enable "$name"
     chroot_run /usr/sbin/emaint sync -r "$name"
     chroot_run /usr/bin/git -C "$repo" fetch origin "$commit"
     chroot_run /usr/bin/git -C "$repo" checkout --detach "$commit"
-    [[ $(chroot "$TARGET" git -C "$repo" rev-parse HEAD) == "$commit" ]] ||
+    actual=$(chroot "$TARGET" /usr/bin/env -i HOME=/root \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/bin/git -C "$repo" rev-parse HEAD) || die "Failed to verify the pinned $name commit."
+    [[ $actual == "$commit" ]] ||
         die "Failed to pin $name to its v1 commit."
 }
 
 reattach_repository() {
     local name=$1 repo=/var/db/repos/$1 branch
-    branch=$(chroot "$TARGET" git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    branch=$(chroot "$TARGET" /usr/bin/env -i HOME=/root \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/bin/git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
     branch=${branch#origin/}
     [[ -n $branch ]] || branch=master
     chroot_run /usr/bin/git -C "$repo" checkout "$branch"
@@ -911,6 +1447,9 @@ write_hyprland_config() {
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
 hl.env("XCURSOR_SIZE", "24")
 hl.env("HYPRCURSOR_SIZE", "24")
+hl.env("XDG_CURRENT_DESKTOP", "Hyprland")
+hl.env("XDG_SESSION_TYPE", "wayland")
+hl.env("XDG_SESSION_DESKTOP", "Hyprland")
 hl.config({
     general = { gaps_in = 5, gaps_out = 10, border_size = 2, layout = "dwindle" },
     decoration = { rounding = 8 },
@@ -919,11 +1458,13 @@ hl.config({
 })
 
 hl.on("hyprland.start", function()
+    hl.exec_cmd("dbus-update-activation-environment WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE")
+    hl.exec_cmd("gentoo-pipewire-launcher")
     hl.exec_cmd("waybar")
     hl.exec_cmd("mako")
     hl.exec_cmd("hyprpaper")
     hl.exec_cmd("hypridle")
-    hl.exec_cmd("hyprpolkitagent")
+    hl.exec_cmd("/usr/libexec/hyprpolkitagent")
     hl.exec_cmd("nm-applet --indicator")
 end)
 
@@ -1027,33 +1568,67 @@ EOF
         packages+=(x11-misc/ly)
     fi
     chroot_run /usr/bin/emerge --verbose --newuse "${packages[@]}"
+    [[ -x $TARGET/usr/bin/start-hyprland && -x $TARGET/usr/bin/dbus-run-session &&
+        -x $TARGET/usr/bin/gentoo-pipewire-launcher && -x $TARGET/usr/libexec/hyprpolkitagent ]] ||
+        die "The installed Hyprland session helpers are incomplete."
+    [[ -r $TARGET/usr/share/X11/xkb/symbols/$XKB_LAYOUT ]] ||
+        die "The selected XKB layout is not installed: $XKB_LAYOUT"
+    run install -d -m 0755 "$TARGET/usr/share/wayland-sessions"
+    cat >"$TARGET/usr/share/wayland-sessions/autogentoo-hyprland.desktop" <<'EOF'
+[Desktop Entry]
+Name=Autogentoo Hyprland
+Comment=Hyprland with an isolated D-Bus user session
+Exec=/usr/bin/env XDG_CURRENT_DESKTOP=Hyprland XDG_SESSION_TYPE=wayland XDG_SESSION_DESKTOP=Hyprland /usr/bin/dbus-run-session /usr/bin/start-hyprland
+TryExec=/usr/bin/start-hyprland
+Type=Application
+DesktopNames=Hyprland
+EOF
+    chmod 0644 "$TARGET/usr/share/wayland-sessions/autogentoo-hyprland.desktop"
     reattach_repository hyproverlay
     if [[ $DISPLAY_MANAGER == ly ]]; then
         reattach_repository guru
         chroot_run /sbin/rc-update del agetty.tty2 default || true
+        [[ ! -e $TARGET/etc/runlevels/default/agetty.tty2 &&
+            ! -L $TARGET/etc/runlevels/default/agetty.tty2 ]] ||
+            die "The tty2 OpenRC getty service could not be disabled for Ly."
+        sed -i -E '/^[^#].*:respawn:.*tty2/ s/^/# autogentoo: /' "$TARGET/etc/inittab"
+        grep -Eq '^[^#].*:respawn:.*tty2' "$TARGET/etc/inittab" &&
+            die "The tty2 getty could not be disabled for Ly."
         chroot_run /sbin/rc-update add ly default
-        [[ ! -f $TARGET/etc/ly/config.ini ]] || sed -i -E 's/^[# ]*tty[ ]*=.*/tty = 2/' "$TARGET/etc/ly/config.ini"
+        [[ -f $TARGET/etc/ly/config.ini ]] || die "Ly did not install its configuration file."
+        sed -i -E 's/^[# ]*tty[ ]*=.*/tty = 2/' "$TARGET/etc/ly/config.ini"
+        grep -Eq '^tty[ ]*=[ ]*2$' "$TARGET/etc/ly/config.ini" ||
+            die "Ly could not be configured on tty2."
     else
         printf 'CHECKVT=7\nDISPLAYMANAGER="sddm"\n' >"$TARGET/etc/conf.d/display-manager"
-        run mkdir -p "$TARGET/etc/sddm.conf.d"
+        run install -d -m 0755 "$TARGET/etc/sddm.conf.d"
         printf '[General]\nDisplayServer=x11\n' >"$TARGET/etc/sddm.conf.d/autogentoo.conf"
+        chmod 0644 "$TARGET/etc/conf.d/display-manager" "$TARGET/etc/sddm.conf.d/autogentoo.conf"
         chroot_run /sbin/rc-update add display-manager default
     fi
     chroot_run /sbin/rc-update add elogind boot
-    write_hyprland_config
 }
 
 create_user() {
-    local groups=wheel,video
+    local groups=wheel,video existing
+    existing=$(awk -F: -v name="$USERNAME" '$1 == name { print $1; exit }' \
+        "$TARGET/etc/passwd") || die "The target account database could not be read."
+    [[ -z $existing ]] || die "The account $USERNAME already exists in the target stage."
+    valid_password_hash "$USER_PASSWORD_HASH" ||
+        die "The password hash is missing or invalid."
     [[ $PROFILE == desktop ]] && groups+=,audio,input
     chroot_run /usr/sbin/useradd -m -G "$groups" -s /bin/bash "$USERNAME"
-    printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | chroot "$TARGET" /usr/sbin/chpasswd
+    printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD_HASH" | chroot "$TARGET" /usr/bin/env -i \
+        HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        /usr/sbin/chpasswd -e
     if (( ROOT_SAME_PASSWORD )); then
-        printf 'root:%s\n' "$USER_PASSWORD" | chroot "$TARGET" /usr/sbin/chpasswd
+        printf 'root:%s\n' "$USER_PASSWORD_HASH" | chroot "$TARGET" /usr/bin/env -i \
+            HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/sbin/chpasswd -e
     else
         chroot_run /usr/bin/passwd -l root
     fi
-    unset USER_PASSWORD
+    unset USER_PASSWORD_HASH
     run mkdir -p "$TARGET/etc/sudoers.d"
     cat >"$TARGET/etc/sudoers.d/wheel" <<'EOF'
 %wheel ALL=(ALL:ALL) ALL
@@ -1070,7 +1645,7 @@ write_fstab() {
     cat >"$TARGET/etc/fstab" <<EOF
 UUID=$root_uuid / btrfs noatime,compress=zstd:1,subvol=@ 0 0
 UUID=$root_uuid /home btrfs noatime,compress=zstd:1,subvol=@home 0 0
-UUID=$esp_uuid /efi vfat umask=0077 0 2
+UUID=$esp_uuid /efi vfat umask=0077,nodev,nosuid,noexec 0 2
 EOF
     if (( SWAP_MIB )); then
         cat >>"$TARGET/etc/fstab" <<EOF
@@ -1078,30 +1653,50 @@ UUID=$root_uuid /.swap btrfs noatime,compress=zstd:1,subvol=@swap 0 0
 /.swap/swapfile none swap defaults 0 0
 EOF
     fi
+    chmod 0644 "$TARGET/etc/fstab"
 }
 
 install_bootloader() {
-    local kernel grub_target
+    local kernel grub_target root_uuid bootloader_id
     kernel=$(find "$TARGET/lib/modules" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n1)
     [[ -n $kernel ]] || die "No installed kernel was found."
     chroot_run /usr/bin/dracut --force --kver "$kernel"
     [[ $ARCH == amd64 ]] && grub_target=x86_64-efi || grub_target=arm64-efi
-    chroot_run /usr/sbin/grub-install --target="$grub_target" --efi-directory=/efi --bootloader-id=Gentoo
+    root_uuid=$(blkid -s UUID -o value "$ROOT_PART")
+    [[ -n $root_uuid ]] || die "The bootloader root UUID could not be read."
+    [[ $MODE == whole ]] && bootloader_id=Gentoo || bootloader_id="Gentoo-$root_uuid"
     if [[ $MODE == whole ]]; then
-        chroot_run /usr/sbin/grub-install --target="$grub_target" --efi-directory=/efi --removable
+        chroot_run /usr/sbin/grub-install --target="$grub_target" --efi-directory=/efi \
+            --bootloader-id="$bootloader_id" --removable
+        if ! chroot_run /usr/sbin/grub-install --target="$grub_target" --efi-directory=/efi \
+            --bootloader-id="$bootloader_id"; then
+            log "WARNING: NVRAM boot entry creation failed; the removable fallback remains installed"
+        fi
+    else
+        chroot_run /usr/sbin/grub-install --target="$grub_target" --efi-directory=/efi \
+            --bootloader-id="$bootloader_id"
     fi
     chroot_run /usr/sbin/grub-mkconfig -o /boot/grub/grub.cfg
 }
 
 perform_install() {
+    storage_plan_still_valid || die "Storage changed before installation; no target disk write was made."
+    prepare_stage_metadata
+    run mkdir -p "$TARGET"
+    storage_plan_still_valid || die "Storage changed while release metadata was verified; no target disk write was made."
     setup_storage
     mount_layout
     download_and_extract_stage
     bind_chroot_filesystems
     write_system_configuration
     install_base
+    if [[ $PROFILE == desktop ]]; then
+        install_desktop
+    fi
     create_user
-    [[ $PROFILE == desktop ]] && install_desktop
+    if [[ $PROFILE == desktop ]]; then
+        write_hyprland_config
+    fi
     write_fstab
     install_bootloader
     run mkdir -p "$TARGET/var/log"
@@ -1125,7 +1720,10 @@ main() {
     collect_storage
     collect_swap
     collect_identity
-    review_and_confirm || return 0
+    review_and_confirm
+    if (( DRY_RUN )); then
+        return 0
+    fi
     perform_install
     dialog_message "Gentoo is installed. The target will now be unmounted cleanly.\n\nRemove the live media and reboot.\nLog: $LOG"
 }

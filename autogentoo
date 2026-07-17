@@ -200,12 +200,11 @@ available_username() {
 }
 
 valid_locale() {
-    [[ $1 =~ ^[A-Za-z]{2,3}_[A-Za-z0-9]{2,3}(\.[A-Za-z0-9_-]+)?(@[A-Za-z0-9_-]+)?$ && ${#1} -le 64 ]]
+    [[ $1 =~ ^[A-Za-z]{2,3}_[A-Za-z0-9]{2,3}\.UTF-8(@[A-Za-z0-9_-]+)?$ && ${#1} -le 64 ]]
 }
 
 supported_locale() {
-    valid_locale "$1" && [[ -r /usr/share/i18n/SUPPORTED ]] &&
-        grep -Fqx -- "$1 UTF-8" /usr/share/i18n/SUPPORTED
+    valid_locale "$1" && [[ -r $2 ]] && grep -Fqx -- "$1 UTF-8" "$2"
 }
 
 valid_layout() {
@@ -470,7 +469,6 @@ preflight() {
     [[ ,$efivar_options, != *,ro,* ]] || die "efivarfs is read-only."
     secure_boot_is_disabled || die "Secure Boot is enabled or its disabled state cannot be proven."
     [[ -r $GENTOO_KEY ]] || die "Gentoo release keys are missing: $GENTOO_KEY"
-    [[ -r /usr/share/i18n/SUPPORTED ]] || die "The live media locale list is missing."
     supported_keymap us || die "The live media console keymaps are missing."
     ARCH=$(arch_name "$(uname -m)") || die "Only x86_64/amd64 and aarch64/arm64 are supported."
     CPU_THREADS=$(nproc) || die "CPU thread count could not be detected."
@@ -748,7 +746,7 @@ collect_password_hash() {
 }
 
 collect_identity() {
-    prompt_validated LOCALE supported_locale "Locale" "Supported UTF-8 locale (for example en_US.UTF-8):" "$LOCALE"
+    prompt_validated LOCALE valid_locale "Locale" "UTF-8 locale (for example en_US.UTF-8):" "$LOCALE"
     while :; do
         ask_value TIMEZONE --title "Timezone" --inputbox "Timezone (for example Europe/Berlin):" 10 72 "$TIMEZONE"
         valid_timezone "$TIMEZONE" && break
@@ -1334,6 +1332,8 @@ download_and_extract_stage() {
     (( actual == STAGE_SIZE )) || die "The stage size does not match its signed pointer."
     (cd "$STAGE_DIR" && printf '%s  %s\n' "$STAGE_DIGEST" "$filename" | sha512sum -c -) | tee -a "$LOG"
     run tar xpf "$archive" --xattrs-include='*.*' --numeric-owner -C "$TARGET"
+    supported_locale "$LOCALE" "$TARGET/usr/share/i18n/SUPPORTED" ||
+        die "The selected locale is not supported by the verified Gentoo stage: $LOCALE"
     run rm -rf -- "$STAGE_DIR"
     STAGE_DIR=""
     run rm -rf -- "$WORKDIR"

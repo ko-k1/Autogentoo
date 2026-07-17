@@ -33,7 +33,12 @@ assert_false available_username daemon
 assert_false available_username sddm
 assert_true valid_locale en_US.UTF-8
 assert_true valid_locale sr_RS.UTF-8@latin
+assert_false valid_locale en_US.ISO-8859-1
 assert_false valid_locale '../etc/passwd'
+printf 'en_US.UTF-8 UTF-8\nsr_RS.UTF-8@latin UTF-8\n' >"$TEST_TMP/SUPPORTED"
+assert_true supported_locale en_US.UTF-8 "$TEST_TMP/SUPPORTED"
+assert_false supported_locale de_DE.UTF-8 "$TEST_TMP/SUPPORTED"
+assert_false supported_locale en_US.UTF-8 "$TEST_TMP/missing-SUPPORTED"
 assert_true valid_layout us
 assert_false valid_layout 'us;reboot'
 mkdir -p "$TEST_TMP/keymaps"

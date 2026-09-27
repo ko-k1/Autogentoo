@@ -1264,9 +1264,9 @@ setup_storage() {
         whole)
             run wipefs -af "$DISK"
             run parted -s -a none "$DISK" mklabel gpt
-            run parted -s -a none "$DISK" unit s mkpart "Gentoo ESP" fat32 "${GAP_START}s" "$((ROOT_START - 1))s"
+            run parted -s -a none "$DISK" unit s mkpart GentooESP fat32 "${GAP_START}s" "$((ROOT_START - 1))s"
             run parted -s "$DISK" set 1 esp on
-            run parted -s -a none "$DISK" unit s mkpart "Gentoo root" btrfs "${ROOT_START}s" "${ROOT_END}s"
+            run parted -s -a none "$DISK" unit s mkpart GentooRoot btrfs "${ROOT_START}s" "${ROOT_END}s"
             settle_partitions "$DISK"
             ESP_PART=$(partition_name "$DISK" 1)
             ROOT_PART=$(partition_name "$DISK" 2)
@@ -1274,14 +1274,14 @@ setup_storage() {
         unallocated)
             if [[ $ESP_ACTION == create ]]; then
                 esp_end=$((ROOT_START - 1))
-                run parted -s -a none "$DISK" unit s mkpart "Gentoo ESP" fat32 "${GAP_START}s" "${esp_end}s"
+                run parted -s -a none "$DISK" unit s mkpart GentooESP fat32 "${GAP_START}s" "${esp_end}s"
                 settle_partitions "$DISK"
                 number=$(part_number_at_start "$DISK" "$GAP_START") ||
                     die "The new EFI System Partition could not be identified."
                 ESP_PART=$(partition_name "$DISK" "$number")
                 run parted -s "$DISK" set "$number" esp on
             fi
-            run parted -s -a none "$DISK" unit s mkpart "Gentoo root" btrfs "${ROOT_START}s" "${ROOT_END}s"
+            run parted -s -a none "$DISK" unit s mkpart GentooRoot btrfs "${ROOT_START}s" "${ROOT_END}s"
             settle_partitions "$DISK"
             number=$(part_number_at_start "$DISK" "$ROOT_START") ||
                 die "The new root partition could not be identified."

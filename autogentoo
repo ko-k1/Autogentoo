@@ -1474,9 +1474,19 @@ base_packages() {
 }
 
 install_base() {
-    local packages=()
+    local packages=() attempt=1
     mapfile -t packages < <(base_packages)
-    chroot_run /usr/bin/emerge --sync
+    while :; do
+        if chroot_run /usr/bin/emerge --sync; then
+            break
+        fi
+        if (( attempt >= 3 )); then
+            die "Gentoo repository sync failed after 3 attempts."
+        fi
+        log "WARNING: repository sync attempt $attempt failed; retrying in 5s"
+        sleep 5
+        attempt=$((attempt + 1))
+    done
     chroot_run /usr/bin/emerge --verbose --update --deep --newuse @world "${packages[@]}"
     chroot_run /usr/sbin/locale-gen
     chroot_run /usr/bin/env-update

@@ -112,11 +112,15 @@ assert_true make_conf_includes_virtual_gpu_support
 base_install_reconciles_world_and_filesystems() (
     local -a calls=()
     ARCH=arm64 CPU_VENDOR=""
+    run() { :; }
+    sleep() { :; }
     chroot_run() { calls+=("$*"); }
     install_base
     [[ ${calls[0]} == '/usr/bin/emerge --sync' &&
-        ${calls[1]} == *'--update --deep --newuse @world'* &&
-        ${calls[1]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* ]]
+        ${calls[1]} == *'--fetchonly'*'--update --deep --newuse @world'* &&
+        ${calls[1]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* &&
+        ${calls[2]} == *'--update --deep --newuse @world'* &&
+        ${calls[2]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* ]]
 )
 assert_true base_install_reconciles_world_and_filesystems
 

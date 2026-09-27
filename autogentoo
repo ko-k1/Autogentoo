@@ -1477,8 +1477,11 @@ base_packages() {
 }
 
 install_base() {
-    local packages=() attempt=1
+    local packages=() attempt=1 fetch_attempt=1
     mapfile -t packages < <(base_packages)
+    ((${#packages[@]})) || die "Base package list could not be determined."
+    run cp -L --remove-destination /etc/resolv.conf "$TARGET/etc/resolv.conf" ||
+        die "Target DNS configuration could not be refreshed."
     while :; do
         if chroot_run /usr/bin/emerge --sync; then
             break
@@ -1489,6 +1492,17 @@ install_base() {
         log "WARNING: repository sync attempt $attempt failed; retrying in 5s"
         sleep 5
         attempt=$((attempt + 1))
+    done
+    while :; do
+        if chroot_run /usr/bin/emerge --fetchonly --update --deep --newuse @world "${packages[@]}"; then
+            break
+        fi
+        if (( fetch_attempt >= 3 )); then
+            die "Base download failed after 3 attempts; check target network/DNS and rerun."
+        fi
+        log "WARNING: base download attempt $fetch_attempt failed; retrying in 5s"
+        sleep 5
+        fetch_attempt=$((fetch_attempt + 1))
     done
     chroot_run /usr/bin/emerge --verbose --update --deep --newuse @world "${packages[@]}"
     chroot_run /usr/sbin/locale-gen

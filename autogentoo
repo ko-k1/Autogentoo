@@ -1416,6 +1416,7 @@ bind_chroot_filesystems() {
     run mount --rbind /run "$TARGET/run"
     run mount --make-rslave "$TARGET/run"
     run cp -L --remove-destination /etc/resolv.conf "$TARGET/etc/resolv.conf"
+    run chmod 0644 "$TARGET/etc/resolv.conf"
 }
 
 write_make_conf() {
@@ -1463,6 +1464,7 @@ EOF
     chmod 0644 "$TARGET/etc/locale.gen" "$TARGET/etc/env.d/02locale" \
         "$TARGET/etc/timezone" "$TARGET/etc/conf.d/hostname" "$TARGET/etc/hosts" \
         "$TARGET/etc/conf.d/keymaps" "$TARGET/etc/portage/package.license/autogentoo" \
+        "$TARGET/etc/portage/package.use/autogentoo" \
         "$TARGET/etc/default/grub"
 }
 
@@ -1482,6 +1484,8 @@ install_base() {
     ((${#packages[@]})) || die "Base package list could not be determined."
     run cp -L --remove-destination /etc/resolv.conf "$TARGET/etc/resolv.conf" ||
         die "Target DNS configuration could not be refreshed."
+    run chmod 0644 "$TARGET/etc/resolv.conf" ||
+        die "Target DNS permissions could not be set."
     while :; do
         if chroot_run /usr/bin/emerge --sync; then
             break

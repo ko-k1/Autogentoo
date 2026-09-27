@@ -127,10 +127,34 @@ die() {
 on_error() {
     local status=$? line=$1
     (( status == 0 )) && return
-    log "ERROR: command failed at line $line (status $status)"
+    trap - ERR
+    set +e
+    local frame lineno func src real_line="" real_func=""
+    local i
+    for ((i = 0; ; i++)); do
+        frame=$(caller "$i" 2>/dev/null) || break
+        read -r lineno func src <<<"$frame" || continue
+        case $func in
+            run|chroot_run|log|quote_command) continue ;;
+        esac
+        real_line=$lineno
+        real_func=$func
+        break
+    done
+    [[ -n $real_line ]] || { real_line=$line; real_func=""; }
+    if [[ -n $real_func && $real_func != main && $real_line != "$line" ]]; then
+        log "ERROR: command failed at line $real_line ($real_func), wrapper line $line (status $status)"
+    else
+        log "ERROR: command failed at line $real_line (status $status)"
+    fi
     if (( DIALOG_READY )); then
-        dialog --title "Installation failed" --msgbox \
-            "A command failed at line $line. The target will be unmounted.\n\nLog: $LOG" 12 72 || true
+        if [[ -n $real_func && $real_func != main && $real_line != "$line" ]]; then
+            dialog --title "Installation failed" --msgbox \
+                "A command failed at line $real_line ($real_func). The target will be unmounted.\n\nLog: $LOG" 12 72 || true
+        else
+            dialog --title "Installation failed" --msgbox \
+                "A command failed at line $real_line. The target will be unmounted.\n\nLog: $LOG" 12 72 || true
+        fi
     fi
     exit "$status"
 }

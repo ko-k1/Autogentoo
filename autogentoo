@@ -93,13 +93,22 @@ quote_command() {
 
 run() {
     log "+ $(quote_command "$@")"
-    "$@" 2>&1 | tee -a "$LOG"
+    if [[ -n $LOG ]]; then
+        "$@" 2>&1 | tee -a "$LOG"
+    else
+        "$@"
+    fi
 }
 
 chroot_run() {
     log "+ chroot $(quote_command "$@")"
-    chroot "$TARGET" /usr/bin/env -i HOME=/root TERM="${TERM:-linux}" \
-        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@" 2>&1 | tee -a "$LOG"
+    if [[ -n $LOG ]]; then
+        chroot "$TARGET" /usr/bin/env -i HOME=/root TERM="${TERM:-linux}" \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@" 2>&1 | tee -a "$LOG"
+    else
+        chroot "$TARGET" /usr/bin/env -i HOME=/root TERM="${TERM:-linux}" \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"
+    fi
 }
 
 dialog_message() {
@@ -772,7 +781,7 @@ choose_timezone() {
         seen["$zone"]=1
     done <<<"$menu"
     ((${#rows[@]})) || die "No usable timezones are present on the live media."
-    if [[ -n ${seen[$TIMEZONE]:-} ]]; then
+    if [[ -n $TIMEZONE && -n ${seen[$TIMEZONE]:-} ]]; then
         ask_value TIMEZONE --title "Timezone" --default-item "$TIMEZONE" --menu \
             "Select the system timezone:" 18 78 10 "${rows[@]}"
     else
@@ -927,7 +936,7 @@ ordinary_linux_partition() {
     [[ ! $mounts =~ [^[:space:]] ]] || return 1
     ro=$(blockdev --getro "$part" 2>/dev/null) || return 1
     [[ $ro == 0 ]] || return 1
-    type=$(lsblk -dnro PARTTYPE "$part")
+    type=$(lsblk -dnro PARTTYPE "$part") || return 1
     [[ ${type,,} == "$LINUX_GUID" ]] || return 1
     has_complex_signature "$part" 1 && return 1
     parent=$(parent_disk "$part" 2>/dev/null) || return 1
@@ -1311,7 +1320,7 @@ sha512_digest() {
 
 stage_pointer_url() {
     local stage
-    [[ $PROFILE == desktop ]] && stage=stage3-amd64-desktop-openrc || stage=stage3-$ARCH-openrc
+    [[ $PROFILE == desktop ]] && stage=stage3-$ARCH-desktop-openrc || stage=stage3-$ARCH-openrc
     printf 'https://distfiles.gentoo.org/releases/%s/autobuilds/latest-%s.txt' "$ARCH" "$stage"
 }
 

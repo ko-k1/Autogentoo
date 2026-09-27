@@ -549,7 +549,7 @@ disk_has_mounts() {
 has_complex_signature() {
     local device=$1 reject_swap=${2:-0} fstype status
     if fstype=$(blkid -p -s TYPE -o value "$device" 2>/dev/null); then
-        [[ -n $fstype ]] || return 0
+        [[ -n $fstype ]] || return 1
     else
         status=$?
         (( status == 2 )) && return 1

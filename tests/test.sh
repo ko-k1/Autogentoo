@@ -119,6 +119,35 @@ assert_eq "$(bounded_uint 08 10)" 8 "leading-zero integer normalization"
 assert_eq "$(bounded_uint 0 10)" 0 "zero is a valid bounded integer"
 assert_false bounded_uint 11 10
 assert_false bounded_uint 9999999999999999999 999999999999999999
+
+ask_value_reaches_caller_named_value() (
+    local value="unchanged"
+    ask() { printf 'typed'; }
+    die() { return 1; }
+    ask_value value --title T --inputbox P 10 72 def
+    [[ $value == typed ]]
+)
+assert_true ask_value_reaches_caller_named_value
+
+prompt_validated_stores_first_valid_answer() (
+    LOCALE="unchanged"
+    ask() { printf 'en_US.UTF-8'; }
+    die() { return 1; }
+    dialog_message() { return 1; }
+    prompt_validated LOCALE valid_locale "Locale" "prompt" "def"
+    [[ $LOCALE == en_US.UTF-8 ]]
+)
+assert_true prompt_validated_stores_first_valid_answer
+
+collect_swap_accepts_recommended_size() (
+    ROOT_BYTES=$((20000 * MIB)) RAM_MIB=4096 PROFILE=base SWAP_MIB=0
+    ask() { printf '4096'; }
+    die() { return 1; }
+    dialog_message() { :; }
+    collect_swap
+    [[ $SWAP_MIB == 4096 ]]
+)
+assert_true collect_swap_accepts_recommended_size
 assert_eq "$(aligned_extent 2049 10000 512)" "4096 8191 4096" "512-byte-sector alignment"
 assert_eq "$(aligned_extent 257 999 4096)" "512 767 256" "4-KiB-sector alignment"
 

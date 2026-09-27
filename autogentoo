@@ -294,10 +294,12 @@ ask() {
 }
 
 ask_value() {
-    local __var=$1 value
+    # __-prefixed internals: callers may target a variable named "value",
+    # which dynamic scope must resolve past this function.
+    local __var=$1 __value
     shift
-    value=$(ask "$@") || die "Installation cancelled before any target write."
-    printf -v "$__var" '%s' "$value"
+    __value=$(ask "$@") || die "Installation cancelled before any target write."
+    printf -v "$__var" '%s' "$__value"
 }
 
 ask_yesno() {

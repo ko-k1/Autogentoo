@@ -1456,6 +1456,9 @@ sys-firmware/intel-microcode intel-ucode
 www-client/firefox-bin MPL-2.0 GPL-2 LGPL-2.1
 x11-drivers/nvidia-drivers NVIDIA-2025
 EOF
+    cat >"$TARGET/etc/portage/package.use/autogentoo" <<'EOF'
+sys-kernel/installkernel dracut
+EOF
     printf 'GRUB_DISABLE_OS_PROBER=true\n' >"$TARGET/etc/default/grub"
     chmod 0644 "$TARGET/etc/locale.gen" "$TARGET/etc/env.d/02locale" \
         "$TARGET/etc/timezone" "$TARGET/etc/conf.d/hostname" "$TARGET/etc/hosts" \

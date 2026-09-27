@@ -1497,6 +1497,8 @@ install_base() {
         sleep 5
         attempt=$((attempt + 1))
     done
+    chroot_run /usr/sbin/locale-gen
+    chroot_run /usr/bin/env-update
     while :; do
         if chroot_run /usr/bin/emerge --fetchonly --update --deep --newuse @world "${packages[@]}"; then
             break
@@ -1509,8 +1511,6 @@ install_base() {
         fetch_attempt=$((fetch_attempt + 1))
     done
     chroot_run /usr/bin/emerge --verbose --update --deep --newuse @world "${packages[@]}"
-    chroot_run /usr/sbin/locale-gen
-    chroot_run /usr/bin/env-update
     chroot_run /sbin/rc-update add NetworkManager default
     chroot_run /sbin/rc-update add dbus default
 }

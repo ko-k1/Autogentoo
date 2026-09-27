@@ -117,10 +117,12 @@ base_install_reconciles_world_and_filesystems() (
     chroot_run() { calls+=("$*"); }
     install_base
     [[ ${calls[0]} == '/usr/bin/emerge --sync' &&
-        ${calls[1]} == *'--fetchonly'*'--update --deep --newuse @world'* &&
-        ${calls[1]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* &&
-        ${calls[2]} == *'--update --deep --newuse @world'* &&
-        ${calls[2]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* ]]
+        ${calls[1]} == '/usr/sbin/locale-gen' &&
+        ${calls[2]} == '/usr/bin/env-update' &&
+        ${calls[3]} == *'--fetchonly'*'--update --deep --newuse @world'* &&
+        ${calls[3]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* &&
+        ${calls[4]} == *'--update --deep --newuse @world'* &&
+        ${calls[4]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* ]]
 )
 assert_true base_install_reconciles_world_and_filesystems
 

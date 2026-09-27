@@ -47,6 +47,48 @@ assert_true supported_keymap us "$TEST_TMP/keymaps"
 assert_false supported_keymap missing "$TEST_TMP/keymaps"
 assert_true valid_timezone UTC
 assert_false valid_timezone zone.tab
+mkdir -p "$TEST_TMP/zoneroot/Europe"
+printf 'TZif-test-data' >"$TEST_TMP/zoneroot/Europe/Berlin"
+printf 'plain-text' >"$TEST_TMP/zoneroot/zone.tab"
+assert_true valid_timezone Europe/Berlin "$TEST_TMP/zoneroot"
+assert_false valid_timezone zone.tab "$TEST_TMP/zoneroot"
+assert_false valid_timezone Missing/Zone "$TEST_TMP/zoneroot"
+assert_false valid_timezone /etc/hostname "$TEST_TMP/zoneroot"
+assert_false valid_timezone ../zoneroot "$TEST_TMP/zoneroot"
+
+timezone_menu_lists_canonical_zones() {
+    local menu expected
+    mkdir -p "$TEST_TMP/tzroot/Europe" "$TEST_TMP/tzroot/posix/Europe" \
+        "$TEST_TMP/tzroot/right" "$TEST_TMP/tzroot/SystemV"
+    printf 'TZif-test-data' >"$TEST_TMP/tzroot/UTC"
+    printf 'TZif-test-data' >"$TEST_TMP/tzroot/Europe/Berlin"
+    printf 'TZif-test-data' >"$TEST_TMP/tzroot/posix/Europe/Berlin"
+    printf 'TZif-test-data' >"$TEST_TMP/tzroot/right/UTC"
+    printf 'TZif-test-data' >"$TEST_TMP/tzroot/SystemV/EST5"
+    printf 'plain-text' >"$TEST_TMP/tzroot/zone.tab"
+    ln -s Europe/Berlin "$TEST_TMP/tzroot/localtime"
+    ln -s Europe/Berlin "$TEST_TMP/tzroot/Alias"
+    menu=$(timezone_menu "$TEST_TMP/tzroot") || return 1
+    expected=$(printf 'Alias\tAlias\nEurope/Berlin\tEurope/Berlin\nUTC\tUTC')
+    [[ $menu == "$expected" ]]
+}
+assert_true timezone_menu_lists_canonical_zones
+
+timezone_menu_fails_closed_without_root() (
+    timezone_menu "$TEST_TMP/missing-zoneroot"
+)
+assert_false timezone_menu_fails_closed_without_root
+
+choose_timezone_accepts_menu_selection() (
+    TIMEZONE="UTC"
+    timezone_menu() { printf 'Europe/Berlin\tEurope/Berlin\nUTC\tUTC\n'; }
+    valid_timezone() { return 0; }
+    ask() { printf 'Europe/Berlin'; }
+    die() { return 1; }
+    choose_timezone
+    [[ $TIMEZONE == Europe/Berlin ]]
+)
+assert_true choose_timezone_accepts_menu_selection
 
 test_password_hash=$(hash_password 'correct horse battery staple')
 assert_true valid_password_hash "$test_password_hash"

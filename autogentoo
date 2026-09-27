@@ -220,12 +220,27 @@ supported_keymap() {
 }
 
 valid_timezone() {
-    local timezone=$1 magic
-    [[ $timezone != /* && $timezone != *..* && -f /usr/share/zoneinfo/$timezone ]] ||
+    local timezone=$1 root=${2:-/usr/share/zoneinfo} magic
+    [[ $timezone != /* && $timezone != *..* && -f "$root/$timezone" ]] ||
         return 1
-    magic=$(od -An -t x1 -N 4 "/usr/share/zoneinfo/$timezone" 2>/dev/null |
+    magic=$(od -An -t x1 -N 4 "$root/$timezone" 2>/dev/null |
         tr -d '[:space:]') || return 1
     [[ $magic == 545a6966 ]]
+}
+
+timezone_menu() {
+    local root=${1:-/usr/share/zoneinfo} path zone
+    root=${root%/}
+    [[ -d $root ]] || return 1
+    while IFS= read -r path; do
+        zone=${path#"$root"/}
+        [[ -n $zone && $zone != "$path" ]] || continue
+        case $zone in
+            posix/*|right/*|SystemV/*|localtime|posixrules) continue ;;
+        esac
+        valid_timezone "$zone" "$root" || continue
+        printf '%s\t%s\n' "$zone" "$zone"
+    done < <(find "$root" -mindepth 1 \( -type f -o -type l \) -print 2>/dev/null | sort)
 }
 
 jobs_for() {
@@ -747,13 +762,30 @@ collect_password_hash() {
     printf '%s\n' "$hash"
 }
 
+choose_timezone() {
+    local rows=() menu zone description
+    local -A seen=()
+    menu=$(timezone_menu) || die "Timezones could not be enumerated safely."
+    while IFS=$'\t' read -r zone description; do
+        [[ -n $zone ]] || continue
+        rows+=("$zone" "$description")
+        seen["$zone"]=1
+    done <<<"$menu"
+    ((${#rows[@]})) || die "No usable timezones are present on the live media."
+    if [[ -n ${seen[$TIMEZONE]:-} ]]; then
+        ask_value TIMEZONE --title "Timezone" --default-item "$TIMEZONE" --menu \
+            "Select the system timezone:" 18 78 10 "${rows[@]}"
+    else
+        ask_value TIMEZONE --title "Timezone" --menu \
+            "Select the system timezone:" 18 78 10 "${rows[@]}"
+    fi
+    valid_timezone "$TIMEZONE" ||
+        die "The selected timezone is not present on the live media."
+}
+
 collect_identity() {
     prompt_validated LOCALE valid_locale "Locale" "UTF-8 locale (for example en_US.UTF-8):" "$LOCALE"
-    while :; do
-        ask_value TIMEZONE --title "Timezone" --inputbox "Timezone (for example Europe/Berlin):" 10 72 "$TIMEZONE"
-        valid_timezone "$TIMEZONE" && break
-        dialog_message "That timezone is not present on the live media."
-    done
+    choose_timezone
     prompt_validated KEYMAP supported_keymap "Console keymap" "Console keymap:" "$KEYMAP"
     if [[ $PROFILE == desktop ]]; then
         prompt_validated XKB_LAYOUT valid_layout "Keyboard layout" "XKB layout for Hyprland:" "$XKB_LAYOUT"

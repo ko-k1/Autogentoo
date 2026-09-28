@@ -1497,6 +1497,8 @@ install_base() {
         sleep 5
         attempt=$((attempt + 1))
     done
+    chroot_run /bin/chmod -R a+rX /var/db/repos/gentoo ||
+        die "Gentoo repository permissions could not be fixed."
     chroot_run /usr/sbin/locale-gen
     chroot_run /usr/bin/env-update
     while :; do
@@ -1529,6 +1531,11 @@ pin_repository() {
         sleep 5
         attempt=$((attempt + 1))
     done
+    # Installer runs under umask 077, but portage drops to the portage
+    # user for the depend phase. Fresh git checkouts would otherwise be
+    # 600/700 and fail with "Permission denied ... masked by: corruption".
+    chroot_run /bin/chmod -R a+rX "$repo" ||
+        die "Repository permissions could not be fixed: $name."
     attempt=1
     while :; do
         if chroot_run /usr/bin/git -C "$repo" fetch origin "$commit"; then
@@ -1542,6 +1549,8 @@ pin_repository() {
         attempt=$((attempt + 1))
     done
     chroot_run /usr/bin/git -C "$repo" checkout --detach "$commit"
+    chroot_run /bin/chmod -R a+rX "$repo" ||
+        die "Pinned repository permissions could not be fixed: $name."
     actual=$(chroot "$TARGET" /usr/bin/env -i HOME=/root \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         /usr/bin/git -C "$repo" rev-parse HEAD) || die "Failed to verify the pinned $name commit."
@@ -1557,6 +1566,8 @@ reattach_repository() {
     branch=${branch#origin/}
     [[ -n $branch ]] || branch=master
     chroot_run /usr/bin/git -C "$repo" checkout "$branch"
+    chroot_run /bin/chmod -R a+rX "$repo" ||
+        die "Repository permissions could not be restored: $name."
 }
 
 write_hyprland_config() {
@@ -1690,25 +1701,33 @@ install_desktop() {
 gui-wm/hyprland X -systemd -uwsm
 media-video/pipewire sound-server
 EOF
+    chmod 0644 "$TARGET/etc/portage/package.accept_keywords/hyproverlay" \
+        "$TARGET/etc/portage/package.accept_keywords/guru" \
+        "$TARGET/etc/portage/package.use/hyprland"
     if (( NVIDIA )); then
         cat >>"$TARGET/etc/portage/package.use/hyprland" <<'EOF'
 x11-drivers/nvidia-drivers kernel-open wayland dist-kernel
 EOF
         printf 'options nvidia_drm modeset=1 fbdev=1\n' >"$TARGET/etc/modprobe.d/nvidia.conf"
+        chmod 0644 "$TARGET/etc/portage/package.use/hyprland" "$TARGET/etc/modprobe.d/nvidia.conf"
         packages+=(x11-drivers/nvidia-drivers)
     fi
     if [[ $DISPLAY_MANAGER == sddm ]]; then
         packages+=(x11-misc/sddm gui-libs/display-manager-init)
     else
         printf 'x11-misc/ly::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/ly"
+        chmod 0644 "$TARGET/etc/portage/package.accept_keywords/ly"
         packages+=(x11-misc/ly::guru)
+    fi
+    if ! chroot_run /usr/bin/emerge --pretend --verbose --newuse "${packages[@]}"; then
+        die "Desktop package resolution failed; inspect $LOG for the portage complaint (masked package, missing ebuild, or USE conflict) and rerun."
     fi
     while :; do
         if chroot_run /usr/bin/emerge --fetchonly --verbose --newuse "${packages[@]}"; then
             break
         fi
         if (( fetch_attempt >= 3 )); then
-            die "Desktop download failed after 3 attempts; inspect $LOG for the portage error (network/DNS, keyword/mask, or missing ebuild) and rerun."
+            die "Desktop download failed after 3 attempts; resolution succeeded, so inspect $LOG for the failing distfile URL or network error and rerun."
         fi
         log "WARNING: desktop download attempt $fetch_attempt failed; retrying in 5s"
         sleep 5

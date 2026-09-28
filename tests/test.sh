@@ -117,12 +117,13 @@ base_install_reconciles_world_and_filesystems() (
     chroot_run() { calls+=("$*"); }
     install_base
     [[ ${calls[0]} == '/usr/bin/emerge --sync' &&
-        ${calls[1]} == '/usr/sbin/locale-gen' &&
-        ${calls[2]} == '/usr/bin/env-update' &&
-        ${calls[3]} == *'--fetchonly'*'--update --deep --newuse @world'* &&
-        ${calls[3]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* &&
-        ${calls[4]} == *'--update --deep --newuse @world'* &&
-        ${calls[4]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* ]]
+        ${calls[1]} == '/bin/chmod -R a+rX /var/db/repos/gentoo' &&
+        ${calls[2]} == '/usr/sbin/locale-gen' &&
+        ${calls[3]} == '/usr/bin/env-update' &&
+        ${calls[4]} == *'--fetchonly'*'--update --deep --newuse @world'* &&
+        ${calls[4]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* &&
+        ${calls[5]} == *'--update --deep --newuse @world'* &&
+        ${calls[5]} == *'sys-fs/btrfs-progs sys-fs/dosfstools'* ]]
 )
 assert_true base_install_reconciles_world_and_filesystems
 
@@ -146,8 +147,9 @@ desktop_install_prefetches_packages() (
     chroot_run() { calls+=("$*"); }
     install_desktop
     [[ ${calls[0]} == *'app-eselect/eselect-repository'* &&
-        ${calls[1]} == *'--fetchonly'*'gui-wm/hyprland'* &&
-        ${calls[2]} == *'gui-wm/hyprland'* && ${calls[2]} != *'--fetchonly'* ]]
+        ${calls[1]} == *'--pretend'*'gui-wm/hyprland'* &&
+        ${calls[2]} == *'--fetchonly'*'gui-wm/hyprland'* &&
+        ${calls[3]} == *'gui-wm/hyprland'* && ${calls[3]} != *'--fetchonly'* && ${calls[3]} != *'--pretend'* ]]
 )
 assert_true desktop_install_prefetches_packages
 
@@ -180,6 +182,37 @@ desktop_download_retries_transient_fetch() (
 )
 assert_true desktop_download_retries_transient_fetch
 
+desktop_resolution_failure_skips_fetch() (
+    TARGET="$TEST_TMP/desktop-noresolve-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc/conf.d" "$TARGET/etc/sddm.conf.d"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    DISPLAY_MANAGER=sddm NVIDIA=0 XKB_LAYOUT=us
+    : >"$TEST_TMP/fetch-counter"
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { :; }
+    reattach_repository() { :; }
+    die() { exit 42; }
+    chroot_run() {
+        if [[ $* == *'--pretend'* ]]; then
+            return 1
+        fi
+        [[ $* == *'--fetchonly'* ]] && echo x >>"$TEST_TMP/fetch-counter"
+        return 0
+    }
+    status=0
+    ( install_desktop ) || status=$?
+    (( status == 42 )) && [[ ! -s $TEST_TMP/fetch-counter ]]
+)
+assert_true desktop_resolution_failure_skips_fetch
+
 pinned_repository_sync_retries() (
     sync_calls=0
     chroot() { printf 'testcommit'; }
@@ -195,6 +228,54 @@ pinned_repository_sync_retries() (
     (( sync_calls == 3 ))
 )
 assert_true pinned_repository_sync_retries
+
+pinned_repository_restores_world_readable_perms() (
+    local -a calls=()
+    TARGET=/tmp/fake-target
+    chroot() { printf 'testcommit'; }
+    sleep() { :; }
+    chroot_run() { calls+=("$*"); return 0; }
+    pin_repository testrepo testcommit || return 1
+    [[ ${calls[*]} == *'/bin/chmod -R a+rX /var/db/repos/testrepo'* ]] || return 1
+    # chmod must run both after sync and after pinned checkout
+    (( $(printf '%s\n' "${calls[@]}" | grep -c 'chmod -R a+rX') >= 2 ))
+)
+assert_true pinned_repository_restores_world_readable_perms
+
+reattach_repository_restores_world_readable_perms() (
+    local -a calls=()
+    TARGET=/tmp/fake-target
+    chroot() { printf 'master'; }
+    chroot_run() { calls+=("$*"); return 0; }
+    reattach_repository testrepo || return 1
+    [[ ${calls[*]} == *'checkout'*master* ]] || return 1
+    [[ ${calls[*]} == *'/bin/chmod -R a+rX /var/db/repos/testrepo'* ]]
+)
+assert_true reattach_repository_restores_world_readable_perms
+
+desktop_portage_configs_are_world_readable() (
+    TARGET="$TEST_TMP/desktop-perms-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc/conf.d" "$TARGET/etc/sddm.conf.d"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    DISPLAY_MANAGER=sddm NVIDIA=0 XKB_LAYOUT=us
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { :; }
+    reattach_repository() { :; }
+    chroot_run() { return 0; }
+    ( umask 077; install_desktop ) || return 1
+    [[ $(stat -c %a "$TARGET/etc/portage/package.accept_keywords/hyproverlay") == 644 ]] || return 1
+    [[ $(stat -c %a "$TARGET/etc/portage/package.accept_keywords/guru") == 644 ]] || return 1
+    [[ $(stat -c %a "$TARGET/etc/portage/package.use/hyprland") == 644 ]]
+)
+assert_true desktop_portage_configs_are_world_readable
 
 desktop_pins_guru_for_brightnessctl_on_sddm() (
     local -a calls=() pins=() reattaches=()
@@ -221,10 +302,10 @@ desktop_pins_guru_for_brightnessctl_on_sddm() (
         "$TARGET/etc/portage/package.accept_keywords/hyproverlay" || return 1
     grep -Fqx 'app-misc/brightnessctl::guru ~amd64' \
         "$TARGET/etc/portage/package.accept_keywords/guru" || return 1
-    [[ ${calls[1]} == *'gui-wm/hyprland'*'::hyproverlay'* &&
-        ${calls[1]} == *'xdg-desktop-portal-hyprland::hyproverlay'* &&
-        ${calls[1]} == *'hyprpolkitagent::hyproverlay'* &&
-        ${calls[1]} == *'brightnessctl::guru'* ]]
+    [[ ${calls[2]} == *'gui-wm/hyprland'*'::hyproverlay'* &&
+        ${calls[2]} == *'xdg-desktop-portal-hyprland::hyproverlay'* &&
+        ${calls[2]} == *'hyprpolkitagent::hyproverlay'* &&
+        ${calls[2]} == *'brightnessctl::guru'* ]]
 )
 assert_true desktop_pins_guru_for_brightnessctl_on_sddm
 

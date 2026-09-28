@@ -1516,10 +1516,31 @@ install_base() {
 }
 
 pin_repository() {
-    local name=$1 commit=$2 repo=/var/db/repos/$1 actual
+    local name=$1 commit=$2 repo=/var/db/repos/$1 actual attempt=1
     chroot_run /usr/bin/eselect repository enable "$name"
-    chroot_run /usr/sbin/emaint sync -r "$name"
-    chroot_run /usr/bin/git -C "$repo" fetch origin "$commit"
+    while :; do
+        if chroot_run /usr/sbin/emaint sync -r "$name"; then
+            break
+        fi
+        if (( attempt >= 3 )); then
+            die "Repository sync failed after 3 attempts: $name."
+        fi
+        log "WARNING: repository sync attempt $attempt for $name failed; retrying in 5s"
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    attempt=1
+    while :; do
+        if chroot_run /usr/bin/git -C "$repo" fetch origin "$commit"; then
+            break
+        fi
+        if (( attempt >= 3 )); then
+            die "Pinned commit fetch failed after 3 attempts: $name."
+        fi
+        log "WARNING: pinned fetch attempt $attempt for $name failed; retrying in 5s"
+        sleep 5
+        attempt=$((attempt + 1))
+    done
     chroot_run /usr/bin/git -C "$repo" checkout --detach "$commit"
     actual=$(chroot "$TARGET" /usr/bin/env -i HOME=/root \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -1634,19 +1655,37 @@ EOF
 
 install_desktop() {
     local packages=(
-        '=gui-wm/hyprland-0.55.4-r1'
+        '=gui-wm/hyprland-0.55.4-r1::hyproverlay'
         gui-apps/waybar gui-apps/fuzzel gui-apps/foot gui-apps/mako
         gui-apps/hyprpaper gui-apps/hyprlock gui-apps/hypridle
-        gui-libs/xdg-desktop-portal-hyprland sys-apps/xdg-desktop-portal
+        gui-libs/xdg-desktop-portal-hyprland::hyproverlay sys-apps/xdg-desktop-portal
         sys-apps/xdg-desktop-portal-gtk media-video/pipewire media-video/wireplumber
-        sys-auth/polkit sys-auth/hyprpolkitagent gnome-extra/nm-applet
+        sys-auth/polkit sys-auth/hyprpolkitagent::hyproverlay gnome-extra/nm-applet
         gui-apps/wl-clipboard gui-apps/grim gui-apps/slurp
-        media-fonts/dejavu media-fonts/noto app-misc/brightnessctl
+        media-fonts/dejavu media-fonts/noto app-misc/brightnessctl::guru
         media-sound/playerctl www-client/firefox-bin
     )
-    chroot_run /usr/bin/emerge --verbose --newuse app-eselect/eselect-repository dev-vcs/git
+    local prereq_attempt=1 fetch_attempt=1
+    ((${#packages[@]})) || die "Desktop package list could not be determined."
+    run cp -L --remove-destination /etc/resolv.conf "$TARGET/etc/resolv.conf" ||
+        die "Target DNS configuration could not be refreshed."
+    run chmod 0644 "$TARGET/etc/resolv.conf" ||
+        die "Target DNS permissions could not be set."
+    while :; do
+        if chroot_run /usr/bin/emerge --verbose --newuse app-eselect/eselect-repository dev-vcs/git; then
+            break
+        fi
+        if (( prereq_attempt >= 3 )); then
+            die "Desktop prerequisites download failed after 3 attempts; check target network/DNS and rerun."
+        fi
+        log "WARNING: desktop prerequisites attempt $prereq_attempt failed; retrying in 5s"
+        sleep 5
+        prereq_attempt=$((prereq_attempt + 1))
+    done
     pin_repository hyproverlay "$HYPROVERLAY_COMMIT"
+    pin_repository guru "$GURU_COMMIT"
     printf '*/*::hyproverlay ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/hyproverlay"
+    printf 'app-misc/brightnessctl::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/guru"
     cat >"$TARGET/etc/portage/package.use/hyprland" <<'EOF'
 gui-wm/hyprland X -systemd -uwsm
 media-video/pipewire sound-server
@@ -1661,10 +1700,20 @@ EOF
     if [[ $DISPLAY_MANAGER == sddm ]]; then
         packages+=(x11-misc/sddm gui-libs/display-manager-init)
     else
-        pin_repository guru "$GURU_COMMIT"
         printf 'x11-misc/ly::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/ly"
-        packages+=(x11-misc/ly)
+        packages+=(x11-misc/ly::guru)
     fi
+    while :; do
+        if chroot_run /usr/bin/emerge --fetchonly --verbose --newuse "${packages[@]}"; then
+            break
+        fi
+        if (( fetch_attempt >= 3 )); then
+            die "Desktop download failed after 3 attempts; inspect $LOG for the portage error (network/DNS, keyword/mask, or missing ebuild) and rerun."
+        fi
+        log "WARNING: desktop download attempt $fetch_attempt failed; retrying in 5s"
+        sleep 5
+        fetch_attempt=$((fetch_attempt + 1))
+    done
     chroot_run /usr/bin/emerge --verbose --newuse "${packages[@]}"
     [[ -x $TARGET/usr/bin/start-hyprland && -x $TARGET/usr/bin/dbus-run-session &&
         -x $TARGET/usr/bin/gentoo-pipewire-launcher && -x $TARGET/usr/libexec/hyprpolkitagent ]] ||
@@ -1683,8 +1732,8 @@ DesktopNames=Hyprland
 EOF
     chmod 0644 "$TARGET/usr/share/wayland-sessions/autogentoo-hyprland.desktop"
     reattach_repository hyproverlay
+    reattach_repository guru
     if [[ $DISPLAY_MANAGER == ly ]]; then
-        reattach_repository guru
         chroot_run /sbin/rc-update del agetty.tty2 default || true
         [[ ! -e $TARGET/etc/runlevels/default/agetty.tty2 &&
             ! -L $TARGET/etc/runlevels/default/agetty.tty2 ]] ||

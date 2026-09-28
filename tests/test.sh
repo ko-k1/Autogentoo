@@ -126,6 +126,141 @@ base_install_reconciles_world_and_filesystems() (
 )
 assert_true base_install_reconciles_world_and_filesystems
 
+desktop_install_prefetches_packages() (
+    local -a calls=()
+    TARGET="$TEST_TMP/desktop-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc/conf.d" "$TARGET/etc/sddm.conf.d"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    DISPLAY_MANAGER=sddm NVIDIA=0 XKB_LAYOUT=us
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { :; }
+    reattach_repository() { :; }
+    chroot_run() { calls+=("$*"); }
+    install_desktop
+    [[ ${calls[0]} == *'app-eselect/eselect-repository'* &&
+        ${calls[1]} == *'--fetchonly'*'gui-wm/hyprland'* &&
+        ${calls[2]} == *'gui-wm/hyprland'* && ${calls[2]} != *'--fetchonly'* ]]
+)
+assert_true desktop_install_prefetches_packages
+
+desktop_download_retries_transient_fetch() (
+    TARGET="$TEST_TMP/desktop-retry-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc/conf.d" "$TARGET/etc/sddm.conf.d"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    DISPLAY_MANAGER=sddm NVIDIA=0 XKB_LAYOUT=us
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { :; }
+    reattach_repository() { :; }
+    fetch_calls=0
+    chroot_run() {
+        if [[ $* == *'--fetchonly'* ]]; then
+            fetch_calls=$((fetch_calls + 1))
+            (( fetch_calls < 2 )) && return 1
+        fi
+        return 0
+    }
+    install_desktop
+    (( fetch_calls == 2 ))
+)
+assert_true desktop_download_retries_transient_fetch
+
+pinned_repository_sync_retries() (
+    sync_calls=0
+    chroot() { printf 'testcommit'; }
+    sleep() { :; }
+    chroot_run() {
+        if [[ $1 == /usr/sbin/emaint ]]; then
+            sync_calls=$((sync_calls + 1))
+            (( sync_calls < 3 )) && return 1
+        fi
+        return 0
+    }
+    pin_repository testrepo testcommit
+    (( sync_calls == 3 ))
+)
+assert_true pinned_repository_sync_retries
+
+desktop_pins_guru_for_brightnessctl_on_sddm() (
+    local -a calls=() pins=() reattaches=()
+    TARGET="$TEST_TMP/desktop-guru-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc/conf.d" "$TARGET/etc/sddm.conf.d"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    DISPLAY_MANAGER=sddm NVIDIA=0 XKB_LAYOUT=us
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { pins+=("$1"); }
+    reattach_repository() { reattaches+=("$1"); }
+    chroot_run() { calls+=("$*"); }
+    install_desktop || return 1
+    [[ ${pins[*]} == *'hyproverlay'* && ${pins[*]} == *'guru'* ]] || return 1
+    [[ ${reattaches[*]} == *'hyproverlay'* && ${reattaches[*]} == *'guru'* ]] || return 1
+    grep -Fqx '*/*::hyproverlay ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/hyproverlay" || return 1
+    grep -Fqx 'app-misc/brightnessctl::guru ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/guru" || return 1
+    [[ ${calls[1]} == *'gui-wm/hyprland'*'::hyproverlay'* &&
+        ${calls[1]} == *'xdg-desktop-portal-hyprland::hyproverlay'* &&
+        ${calls[1]} == *'hyprpolkitagent::hyproverlay'* &&
+        ${calls[1]} == *'brightnessctl::guru'* ]]
+)
+assert_true desktop_pins_guru_for_brightnessctl_on_sddm
+
+desktop_ly_atom_is_guru_qualified() (
+    TARGET="$TEST_TMP/desktop-ly-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc" "$TARGET/etc/runlevels/default"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    printf 'tty2::respawn:/sbin/agetty tty2\n' >"$TARGET/etc/inittab"
+    mkdir -p "$TARGET/etc/ly"
+    printf 'tty = 1\n' >"$TARGET/etc/ly/config.ini"
+    DISPLAY_MANAGER=ly NVIDIA=0 XKB_LAYOUT=us
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { :; }
+    reattach_repository() { :; }
+    fetch_arg=""
+    chroot_run() {
+        [[ $* == *'--fetchonly'* ]] && fetch_arg="$*"
+        return 0
+    }
+    install_desktop || return 1
+    [[ $fetch_arg == *'x11-misc/ly::guru'* ]] || return 1
+    grep -Fqx 'x11-misc/ly::guru ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/ly" || return 1
+    grep -Fqx 'app-misc/brightnessctl::guru ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/guru"
+)
+assert_true desktop_ly_atom_is_guru_qualified
+
 desktop_packages_precede_login_creation() (
     local order=""
     PROFILE=desktop

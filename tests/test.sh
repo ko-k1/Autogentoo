@@ -309,6 +309,36 @@ desktop_pins_guru_for_brightnessctl_on_sddm() (
 )
 assert_true desktop_pins_guru_for_brightnessctl_on_sddm
 
+desktop_main_tree_atoms_are_gentoo_qualified() (
+    local fetch_arg=""
+    TARGET="$TEST_TMP/desktop-gentoo-target"
+    mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \
+        "$TARGET/etc/modprobe.d" "$TARGET/usr/bin" "$TARGET/usr/libexec" \
+        "$TARGET/usr/share/X11/xkb/symbols" "$TARGET/usr/share/wayland-sessions" \
+        "$TARGET/etc/conf.d" "$TARGET/etc/sddm.conf.d"
+    touch "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    chmod +x "$TARGET/usr/bin/start-hyprland" "$TARGET/usr/bin/dbus-run-session" \
+        "$TARGET/usr/bin/gentoo-pipewire-launcher" "$TARGET/usr/libexec/hyprpolkitagent"
+    : >"$TARGET/usr/share/X11/xkb/symbols/us"
+    DISPLAY_MANAGER=sddm NVIDIA=0 XKB_LAYOUT=us
+    run() { :; }
+    sleep() { :; }
+    pin_repository() { :; }
+    reattach_repository() { :; }
+    chroot_run() {
+        [[ $* == *'--pretend'* ]] && fetch_arg="$*"
+        return 0
+    }
+    install_desktop || return 1
+    # guru-shadowed fuzzel must resolve from gentoo, not guru testing
+    [[ $fetch_arg == *'gui-apps/fuzzel::gentoo'* ]] || return 1
+    [[ $fetch_arg == *'gui-apps/waybar::gentoo'* ]] || return 1
+    [[ $fetch_arg == *'x11-misc/sddm::gentoo'* ]] || return 1
+    [[ $fetch_arg != *' gui-apps/fuzzel ' && $fetch_arg != *' gui-apps/fuzzel--'* ]]
+)
+assert_true desktop_main_tree_atoms_are_gentoo_qualified
+
 desktop_ly_atom_is_guru_qualified() (
     TARGET="$TEST_TMP/desktop-ly-target"
     mkdir -p "$TARGET/etc/portage/package.accept_keywords" "$TARGET/etc/portage/package.use" \

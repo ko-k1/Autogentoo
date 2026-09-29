@@ -1667,14 +1667,14 @@ EOF
 install_desktop() {
     local packages=(
         '=gui-wm/hyprland-0.55.4-r1::hyproverlay'
-        gui-apps/waybar gui-apps/fuzzel gui-apps/foot gui-apps/mako
-        gui-apps/hyprpaper gui-apps/hyprlock gui-apps/hypridle
-        gui-libs/xdg-desktop-portal-hyprland::hyproverlay sys-apps/xdg-desktop-portal
-        sys-apps/xdg-desktop-portal-gtk media-video/pipewire media-video/wireplumber
-        sys-auth/polkit sys-auth/hyprpolkitagent::hyproverlay gnome-extra/nm-applet
-        gui-apps/wl-clipboard gui-apps/grim gui-apps/slurp
-        media-fonts/dejavu media-fonts/noto app-misc/brightnessctl::guru
-        media-sound/playerctl www-client/firefox-bin
+        gui-apps/waybar::gentoo gui-apps/fuzzel::gentoo gui-apps/foot::gentoo gui-apps/mako::gentoo
+        gui-apps/hyprpaper::gentoo gui-apps/hyprlock::gentoo gui-apps/hypridle::gentoo
+        gui-libs/xdg-desktop-portal-hyprland::hyproverlay sys-apps/xdg-desktop-portal::gentoo
+        sys-apps/xdg-desktop-portal-gtk::gentoo media-video/pipewire::gentoo media-video/wireplumber::gentoo
+        sys-auth/polkit::gentoo sys-auth/hyprpolkitagent::hyproverlay gnome-extra/nm-applet::gentoo
+        gui-apps/wl-clipboard::gentoo gui-apps/grim::gentoo gui-apps/slurp::gentoo
+        media-fonts/dejavu::gentoo media-fonts/noto::gentoo app-misc/brightnessctl::guru
+        media-sound/playerctl::gentoo www-client/firefox-bin::gentoo
     )
     local prereq_attempt=1 fetch_attempt=1
     ((${#packages[@]})) || die "Desktop package list could not be determined."
@@ -1710,10 +1710,10 @@ x11-drivers/nvidia-drivers kernel-open wayland dist-kernel
 EOF
         printf 'options nvidia_drm modeset=1 fbdev=1\n' >"$TARGET/etc/modprobe.d/nvidia.conf"
         chmod 0644 "$TARGET/etc/portage/package.use/hyprland" "$TARGET/etc/modprobe.d/nvidia.conf"
-        packages+=(x11-drivers/nvidia-drivers)
+        packages+=(x11-drivers/nvidia-drivers::gentoo)
     fi
     if [[ $DISPLAY_MANAGER == sddm ]]; then
-        packages+=(x11-misc/sddm gui-libs/display-manager-init)
+        packages+=(x11-misc/sddm::gentoo gui-libs/display-manager-init::gentoo)
     else
         printf 'x11-misc/ly::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/ly"
         chmod 0644 "$TARGET/etc/portage/package.accept_keywords/ly"

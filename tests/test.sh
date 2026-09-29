@@ -331,11 +331,19 @@ desktop_main_tree_atoms_are_gentoo_qualified() (
         return 0
     }
     install_desktop || return 1
-    # guru-shadowed fuzzel must resolve from gentoo, not guru testing
-    [[ $fetch_arg == *'gui-apps/fuzzel::gentoo'* ]] || return 1
+    # fuzzel lives in GURU only, hyprpaper/lock/idle live in hyproverlay only;
+    # everything else mainstream resolves from gentoo to avoid overlay shadowing
+    [[ $fetch_arg == *'gui-apps/fuzzel::guru'* ]] || return 1
+    [[ $fetch_arg == *'gui-apps/hyprpaper::hyproverlay'* ]] || return 1
+    [[ $fetch_arg == *'gui-apps/hyprlock::hyproverlay'* ]] || return 1
+    [[ $fetch_arg == *'gui-apps/hypridle::hyproverlay'* ]] || return 1
     [[ $fetch_arg == *'gui-apps/waybar::gentoo'* ]] || return 1
     [[ $fetch_arg == *'x11-misc/sddm::gentoo'* ]] || return 1
-    [[ $fetch_arg != *' gui-apps/fuzzel ' && $fetch_arg != *' gui-apps/fuzzel--'* ]]
+    [[ $fetch_arg != *' gui-apps/fuzzel::gentoo'* ]]
+    grep -Fqx 'gui-apps/fuzzel::guru ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/guru" || return 1
+    grep -Fqx 'app-misc/brightnessctl::guru ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/guru"
 )
 assert_true desktop_main_tree_atoms_are_gentoo_qualified
 

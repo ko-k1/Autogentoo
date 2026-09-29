@@ -1667,8 +1667,8 @@ EOF
 install_desktop() {
     local packages=(
         '=gui-wm/hyprland-0.55.4-r1::hyproverlay'
-        gui-apps/waybar::gentoo gui-apps/fuzzel::gentoo gui-apps/foot::gentoo gui-apps/mako::gentoo
-        gui-apps/hyprpaper::gentoo gui-apps/hyprlock::gentoo gui-apps/hypridle::gentoo
+        gui-apps/waybar::gentoo gui-apps/fuzzel::guru gui-apps/foot::gentoo gui-apps/mako::gentoo
+        gui-apps/hyprpaper::hyproverlay gui-apps/hyprlock::hyproverlay gui-apps/hypridle::hyproverlay
         gui-libs/xdg-desktop-portal-hyprland::hyproverlay sys-apps/xdg-desktop-portal::gentoo
         sys-apps/xdg-desktop-portal-gtk::gentoo media-video/pipewire::gentoo media-video/wireplumber::gentoo
         sys-auth/polkit::gentoo sys-auth/hyprpolkitagent::hyproverlay gnome-extra/nm-applet::gentoo
@@ -1696,7 +1696,7 @@ install_desktop() {
     pin_repository hyproverlay "$HYPROVERLAY_COMMIT"
     pin_repository guru "$GURU_COMMIT"
     printf '*/*::hyproverlay ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/hyproverlay"
-    printf 'app-misc/brightnessctl::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/guru"
+    printf 'app-misc/brightnessctl::guru ~amd64\ngui-apps/fuzzel::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/guru"
     cat >"$TARGET/etc/portage/package.use/hyprland" <<'EOF'
 gui-wm/hyprland X -systemd -uwsm
 media-video/pipewire sound-server

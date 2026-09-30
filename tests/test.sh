@@ -341,6 +341,7 @@ desktop_main_tree_atoms_are_gentoo_qualified() (
     [[ $fetch_arg == *'gui-apps/hypridle::hyproverlay'* ]] || return 1
     [[ $fetch_arg == *'gui-apps/waybar::gentoo'* ]] || return 1
     [[ $fetch_arg == *'x11-misc/sddm::gentoo'* ]] || return 1
+    [[ $fetch_arg == *'x11-misc/xkeyboard-config::gentoo'* ]] || return 1
     [[ $fetch_arg != *' gui-apps/fuzzel::gentoo'* ]]
     grep -Fqx 'gui-apps/fuzzel::guru ~amd64' \
         "$TARGET/etc/portage/package.accept_keywords/guru" || return 1

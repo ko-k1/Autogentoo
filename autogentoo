@@ -1424,7 +1424,7 @@ write_make_conf() {
     jobs=$(jobs_for "$CPU_THREADS" "$RAM_MIB")
     load=$((jobs + 1))
     [[ $ARCH == amd64 ]] && native=-march=native || native=-mcpu=native
-    video_cards="amdgpu radeonsi intel virgl"
+    video_cards="amdgpu radeon radeonsi intel virgl"
     (( NVIDIA )) && video_cards+=" nvidia"
     cat >"$TARGET/etc/portage/make.conf" <<EOF
 COMMON_FLAGS="-O2 -pipe $native"
@@ -1695,7 +1695,7 @@ install_desktop() {
     done
     pin_repository hyproverlay "$HYPROVERLAY_COMMIT"
     pin_repository guru "$GURU_COMMIT"
-    printf '*/*::hyproverlay ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/hyproverlay"
+    printf '*/*::hyproverlay ~amd64\ndev-cpp/sdbus-c++ ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/hyproverlay"
     printf 'app-misc/brightnessctl::guru ~amd64\ngui-apps/fuzzel::guru ~amd64\n' >"$TARGET/etc/portage/package.accept_keywords/guru"
     cat >"$TARGET/etc/portage/package.use/hyprland" <<'EOF'
 gui-wm/hyprland X -systemd -uwsm

@@ -104,7 +104,7 @@ make_conf_includes_virtual_gpu_support() (
     ARCH=amd64 CPU_THREADS=4 RAM_MIB=8192 NVIDIA=0
     mkdir -p "$TARGET/etc/portage"
     write_make_conf
-    grep -Fqx 'VIDEO_CARDS="amdgpu radeonsi intel virgl"' \
+    grep -Fqx 'VIDEO_CARDS="amdgpu radeon radeonsi intel virgl"' \
         "$TARGET/etc/portage/make.conf"
 )
 assert_true make_conf_includes_virtual_gpu_support
@@ -299,6 +299,8 @@ desktop_pins_guru_for_brightnessctl_on_sddm() (
     [[ ${pins[*]} == *'hyproverlay'* && ${pins[*]} == *'guru'* ]] || return 1
     [[ ${reattaches[*]} == *'hyproverlay'* && ${reattaches[*]} == *'guru'* ]] || return 1
     grep -Fqx '*/*::hyproverlay ~amd64' \
+        "$TARGET/etc/portage/package.accept_keywords/hyproverlay" || return 1
+    grep -Fqx 'dev-cpp/sdbus-c++ ~amd64' \
         "$TARGET/etc/portage/package.accept_keywords/hyproverlay" || return 1
     grep -Fqx 'app-misc/brightnessctl::guru ~amd64' \
         "$TARGET/etc/portage/package.accept_keywords/guru" || return 1

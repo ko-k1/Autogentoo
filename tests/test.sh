@@ -149,7 +149,8 @@ desktop_install_prefetches_packages() (
     [[ ${calls[0]} == *'app-eselect/eselect-repository'* &&
         ${calls[1]} == *'--pretend'*'gui-wm/hyprland'* &&
         ${calls[2]} == *'--fetchonly'*'gui-wm/hyprland'* &&
-        ${calls[3]} == *'gui-wm/hyprland'* && ${calls[3]} != *'--fetchonly'* && ${calls[3]} != *'--pretend'* ]]
+        ${calls[3]} == *'gui-wm/hyprland'* && ${calls[3]} != *'--fetchonly'* && ${calls[3]} != *'--pretend'* &&
+        ${calls[4]} == *'x11-misc/xkeyboard-config::gentoo'* ]]
 )
 assert_true desktop_install_prefetches_packages
 

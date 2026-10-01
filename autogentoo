@@ -1734,11 +1734,20 @@ EOF
         fetch_attempt=$((fetch_attempt + 1))
     done
     chroot_run /usr/bin/emerge --verbose --newuse "${packages[@]}"
+    # xkeyboard-config may already be in the stage without being in the merge
+    # list above; ensure the symbols database is present for the layout check.
+    chroot_run /usr/bin/emerge --verbose --newuse x11-misc/xkeyboard-config::gentoo
     [[ -x $TARGET/usr/bin/start-hyprland && -x $TARGET/usr/bin/dbus-run-session &&
         -x $TARGET/usr/bin/gentoo-pipewire-launcher && -x $TARGET/usr/libexec/hyprpolkitagent ]] ||
         die "The installed Hyprland session helpers are incomplete."
-    [[ -r $TARGET/usr/share/X11/xkb/symbols/$XKB_LAYOUT || -r $TARGET/usr/share/xkb/symbols/$XKB_LAYOUT ]] ||
+    if [[ ! -r $TARGET/usr/share/X11/xkb/symbols/$XKB_LAYOUT && ! -r $TARGET/usr/share/xkb/symbols/$XKB_LAYOUT ]]; then
+        log "ERROR: XKB symbols missing for layout $XKB_LAYOUT"
+        log "--- $TARGET/usr/share/X11/xkb/symbols listing ---"
+        ls -la "$TARGET/usr/share/X11/xkb/symbols/" >>"$LOG" 2>&1 || log "(no X11 xkb symbols dir)"
+        log "--- $TARGET/usr/share/xkb/symbols listing ---"
+        ls -la "$TARGET/usr/share/xkb/symbols/" >>"$LOG" 2>&1 || log "(no xkb symbols dir)"
         die "The selected XKB layout is not installed: $XKB_LAYOUT"
+    fi
     run install -d -m 0755 "$TARGET/usr/share/wayland-sessions"
     cat >"$TARGET/usr/share/wayland-sessions/autogentoo-hyprland.desktop" <<'EOF'
 [Desktop Entry]
